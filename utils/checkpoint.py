@@ -1,0 +1,36 @@
+"""Checkpoint save/load for world model training."""
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+
+import torch
+
+from data.normalization import NormStats
+from utils.config import RunConfig
+
+
+def save_checkpoint(path, model, optimizer, norm_stats: NormStats,
+                    config: RunConfig, epoch: int, metrics: dict | None = None):
+    """Save everything needed to resume training or run evaluation."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "norm_stats": norm_stats.to_dict(),
+        "config": dataclasses.asdict(config),
+        "epoch": epoch,
+        "metrics": metrics or {},
+    }, path)
+
+
+def load_checkpoint(path, device="cpu") -> dict:
+    """Load checkpoint. Returns dict with all saved components.
+
+    Returns:
+        dict with keys: model_state_dict, optimizer_state_dict,
+        norm_stats (dict), config (RunConfig), epoch, metrics
+    """
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt["config"] = RunConfig(**ckpt["config"])
+    return ckpt
