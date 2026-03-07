@@ -83,3 +83,35 @@ def test_mlp_gradient_flows_through_all_layers():
     for name, param in model.named_parameters():
         assert param.grad is not None, f"No gradient for {name}"
         assert param.grad.abs().sum() > 0, f"Zero gradient for {name}"
+
+
+from models.factory import build_model
+from utils.config import RunConfig
+
+
+def test_build_linear():
+    cfg = RunConfig(arch="linear", arch_params={}, data_path="/tmp",
+                    state_dim=8, action_dim=2)
+    model = build_model(cfg)
+    assert isinstance(model, LinearModel)
+    delta, _ = model.step(torch.randn(2, 8), torch.randn(2, 2))
+    assert delta.shape == (2, 8)
+
+
+def test_build_mlp():
+    cfg = RunConfig(arch="mlp", arch_params={"hidden_dims": [64, 64]},
+                    data_path="/tmp", state_dim=8, action_dim=2)
+    model = build_model(cfg)
+    assert isinstance(model, MLPModel)
+
+
+def test_build_mlp_defaults():
+    cfg = RunConfig(arch="mlp", data_path="/tmp", state_dim=8, action_dim=2)
+    model = build_model(cfg)
+    assert isinstance(model, MLPModel)
+
+
+def test_build_unknown_arch():
+    cfg = RunConfig(arch="transformer", data_path="/tmp")
+    with pytest.raises(ValueError, match="Unknown architecture"):
+        build_model(cfg)
