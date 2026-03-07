@@ -5,6 +5,7 @@ from utils.config import RunConfig
 from models.linear import LinearModel
 from models.mlp import MLPModel
 from models.gru import GRUModel
+from models.rssm import RSSMModel
 
 
 def build_model(config: RunConfig):
@@ -33,8 +34,18 @@ def build_model(config: RunConfig):
             encoder_dims=params.get("encoder_dims"),
             decoder_dims=params.get("decoder_dims"),
         )
+    elif config.arch == "rssm":
+        params = config.arch_params
+        return RSSMModel(
+            state_dim=config.state_dim,
+            action_dim=config.action_dim,
+            deter_dim=params.get("deter_dim", 200),
+            stoch_dim=params.get("stoch_dim", 30),
+            hidden_dim=params.get("hidden_dim", 200),
+            encoder_dims=params.get("encoder_dims"),
+        )
     else:
         raise ValueError(
             f"Unknown architecture: {config.arch}. "
-            f"Available: linear, mlp, gru"
+            f"Available: linear, mlp, gru, rssm"
         )

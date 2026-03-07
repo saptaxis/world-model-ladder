@@ -205,6 +205,25 @@ def test_build_gru_defaults():
     assert isinstance(model, GRUModel)
 
 
+from models.rssm import RSSMModel
+
+
+def test_build_rssm():
+    cfg = RunConfig(arch="rssm", arch_params={"deter_dim": 64, "stoch_dim": 16,
+                    "hidden_dim": 32, "encoder_dims": [32]},
+                    data_path="/tmp", state_dim=8, action_dim=2)
+    model = build_model(cfg)
+    assert isinstance(model, RSSMModel)
+    delta, ms = model.step(torch.randn(2, 8), torch.randn(2, 2))
+    assert delta.shape == (2, 8)
+
+
+def test_build_rssm_defaults():
+    cfg = RunConfig(arch="rssm", data_path="/tmp", state_dim=8, action_dim=2)
+    model = build_model(cfg)
+    assert isinstance(model, RSSMModel)
+
+
 def test_build_unknown_arch():
     cfg = RunConfig(arch="transformer", data_path="/tmp")
     with pytest.raises(ValueError, match="Unknown architecture"):
