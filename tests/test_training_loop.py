@@ -75,3 +75,32 @@ def test_train_epoch_scheduled_sampling(episode_dir):
                           rollout_k=5, sampling_prob=0.3)
     assert metrics["train_loss"] > 0
     assert metrics["train_loss"] < 1000
+
+
+from models.rssm import RSSMModel
+
+
+def test_train_epoch_rssm_multi_step(episode_dir):
+    ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    loader = DataLoader(ds, batch_size=8, shuffle=True, drop_last=True)
+    model = RSSMModel(state_dim=8, action_dim=2, deter_dim=32, stoch_dim=8,
+                      hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    norm_stats = compute_norm_stats(ds.episode_dicts())
+    metrics = train_epoch(model, loader, optimizer, norm_stats,
+                          training_mode="multi_step", rollout_k=5)
+    assert metrics["train_loss"] > 0
+    assert metrics["train_loss"] < 1000
+
+
+def test_train_epoch_rssm_elbo(episode_dir):
+    ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    loader = DataLoader(ds, batch_size=8, shuffle=True, drop_last=True)
+    model = RSSMModel(state_dim=8, action_dim=2, deter_dim=32, stoch_dim=8,
+                      hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    norm_stats = compute_norm_stats(ds.episode_dicts())
+    metrics = train_epoch(model, loader, optimizer, norm_stats,
+                          training_mode="elbo", rollout_k=5, kl_weight=0.5)
+    assert metrics["train_loss"] > 0
+    assert metrics["train_loss"] < 1000

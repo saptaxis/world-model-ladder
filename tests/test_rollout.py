@@ -127,3 +127,42 @@ def test_gru_scheduled_sampling():
     deltas, ms = rollout_scheduled_sampling(model, true_states, actions, sampling_prob=0.5)
     assert deltas.shape == (BATCH, T, STATE_DIM)
     assert ms is not None
+
+
+from models.rssm import RSSMModel
+from models.rssm_state import RSSMState
+
+
+def _make_rssm():
+    return RSSMModel(state_dim=STATE_DIM, action_dim=ACTION_DIM,
+                     deter_dim=32, stoch_dim=8, hidden_dim=16)
+
+
+def test_rssm_open_loop_shapes():
+    model = _make_rssm()
+    s0 = torch.randn(BATCH, STATE_DIM)
+    actions = torch.randn(BATCH, T, ACTION_DIM)
+    states, deltas, ms = rollout_open_loop(model, s0, actions)
+    assert states.shape == (BATCH, T + 1, STATE_DIM)
+    assert deltas.shape == (BATCH, T, STATE_DIM)
+    assert isinstance(ms, RSSMState)
+
+
+def test_rssm_teacher_forced_shapes():
+    model = _make_rssm()
+    true_states = torch.randn(BATCH, T, STATE_DIM)
+    actions = torch.randn(BATCH, T, ACTION_DIM)
+    deltas, ms = rollout_teacher_forced(model, true_states, actions)
+    assert deltas.shape == (BATCH, T, STATE_DIM)
+    assert isinstance(ms, RSSMState)
+
+
+def test_rssm_warmup_then_branch():
+    model = _make_rssm()
+    prefix_states = torch.randn(BATCH, 5, STATE_DIM)
+    prefix_actions = torch.randn(BATCH, 5, ACTION_DIM)
+    branch_actions = torch.randn(BATCH, T, ACTION_DIM)
+    states, deltas, ms = rollout_warmup_then_branch(
+        model, prefix_states, prefix_actions, branch_actions)
+    assert states.shape == (BATCH, T + 1, STATE_DIM)
+    assert isinstance(ms, RSSMState)
