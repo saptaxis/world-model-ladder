@@ -85,6 +85,83 @@ def test_mlp_gradient_flows_through_all_layers():
         assert param.grad.abs().sum() > 0, f"Zero gradient for {name}"
 
 
+from models.gru import GRUModel
+
+
+def test_gru_output_shape():
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=32, num_layers=1,
+                     encoder_dims=[16], decoder_dims=[16])
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    delta, ms = model.step(obs, action)
+    assert delta.shape == (4, 8)
+    assert ms is not None
+    assert ms.shape == (1, 4, 32)  # [num_layers, batch, hidden_dim]
+
+
+def test_gru_is_world_model():
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=32)
+    assert isinstance(model, WorldModel)
+
+
+def test_gru_initial_state():
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=32, num_layers=2)
+    ms = model.initial_state(batch_size=4)
+    assert ms.shape == (2, 4, 32)
+    assert (ms == 0).all()
+
+
+def test_gru_initial_state_device():
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=32)
+    ms = model.initial_state(batch_size=4, device="cpu")
+    assert ms.device == torch.device("cpu")
+
+
+def test_gru_hidden_state_evolves():
+    """Consecutive steps should produce different hidden states."""
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=32)
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    _, ms1 = model.step(obs, action)
+    _, ms2 = model.step(obs, action, ms1)
+    assert not torch.allclose(ms1, ms2)
+
+
+def test_gru_gradient_flows():
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=32,
+                     encoder_dims=[16], decoder_dims=[16])
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    delta, ms = model.step(obs, action)
+    # Step again to test gradients through hidden state
+    delta2, _ = model.step(obs, action, ms)
+    loss = delta2.pow(2).mean()
+    loss.backward()
+    for name, param in model.named_parameters():
+        assert param.grad is not None, f"No gradient for {name}"
+        assert param.grad.abs().sum() > 0, f"Zero gradient for {name}"
+
+
+def test_gru_multi_layer():
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=64, num_layers=3,
+                     encoder_dims=[32], decoder_dims=[32])
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    delta, ms = model.step(obs, action)
+    assert delta.shape == (4, 8)
+    assert ms.shape == (3, 4, 64)
+
+
+def test_gru_default_encoder_decoder():
+    """GRU with no encoder/decoder dims should still work (direct projection)."""
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=32)
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    delta, ms = model.step(obs, action)
+    assert delta.shape == (4, 8)
+    assert ms.shape == (1, 4, 32)
+
+
 from models.factory import build_model
 from utils.config import RunConfig
 
@@ -109,6 +186,23 @@ def test_build_mlp_defaults():
     cfg = RunConfig(arch="mlp", data_path="/tmp", state_dim=8, action_dim=2)
     model = build_model(cfg)
     assert isinstance(model, MLPModel)
+
+
+def test_build_gru():
+    cfg = RunConfig(arch="gru", arch_params={"hidden_dim": 64, "num_layers": 1,
+                    "encoder_dims": [32], "decoder_dims": [32]},
+                    data_path="/tmp", state_dim=8, action_dim=2)
+    model = build_model(cfg)
+    assert isinstance(model, GRUModel)
+    delta, ms = model.step(torch.randn(2, 8), torch.randn(2, 2))
+    assert delta.shape == (2, 8)
+    assert ms.shape == (1, 2, 64)
+
+
+def test_build_gru_defaults():
+    cfg = RunConfig(arch="gru", data_path="/tmp", state_dim=8, action_dim=2)
+    model = build_model(cfg)
+    assert isinstance(model, GRUModel)
 
 
 def test_build_unknown_arch():
