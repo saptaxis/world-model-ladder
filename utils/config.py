@@ -29,9 +29,7 @@ class RunConfig:
     data_path: str = ""                 # required — validated in __post_init__
 
     # Environment
-    env: str = "lunar_lander"
-    physics_config: str | None = None
-    state_dim: int = 8                  # 8 for kinematic-only (Levels 0-3)
+    state_dim: int = 8
     action_dim: int = 2
 
     # Training hyperparams

@@ -38,7 +38,7 @@ class EpisodeDataset(Dataset):
         seed: int = 0,
     ):
         self.state_dim = state_dim
-        self.action_dim = 2  # Lunar Lander
+        self.action_dim = 2
         self.mode = mode
         self.seq_len = seq_len
 

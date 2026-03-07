@@ -1,12 +1,12 @@
 # World Model Ladder
 
-A minimal research framework for building and evaluating world models, from simple transition predictors to latent stochastic simulators.
+A minimal, environment-agnostic research framework for building and evaluating world models, from simple transition predictors to latent stochastic simulators.
 
 > **Research repo: expect rough edges.** Code here is exploratory and evolves quickly. Expect incomplete experiments and changing APIs.
 
 This repository implements a ladder of increasingly expressive dynamics models for learning environment transitions. The goal is to clarify what actually makes a *world model*.
 
-The ladder starts with linear predictors and progresses through MLP dynamics models, rollout-trained simulators, recurrent models, parameterized physics models, and latent stochastic world models (RSSM).
+The code is fully environment-agnostic — it reads state/action trajectories from `.npz` files and trains transition functions. Any environment that produces `(states, actions)` sequences works. The first testbed is a custom fork of Gymnasium's LunarLander-v3 that parameterizes 7 physics variables (gravity, thrust power, density, damping, wind), but the models, training, and evaluation code know nothing about the environment.
 
 ## Thesis
 
@@ -27,18 +27,6 @@ This repository explores a structured ladder of models to answer:
 - What data is required for counterfactual correctness?
 - Does memory help in fully observed environments?
 - When do latent stochastic models become necessary?
-
-## Why Lunar Lander
-
-Lunar Lander is used as the initial environment because it provides:
-
-- Low-dimensional state (8 dims, no perception problem)
-- Continuous Newtonian physics (known ground truth via Box2D)
-- Action-driven control (thrust, rotation)
-- Parameterizable physics (gravity, thrust power, damping)
-- Interpretable interventions (free fall, hover, pulse thrust)
-
-This makes it possible to study world model behavior directly, without the complexity of high-dimensional visual observations.
 
 ## The World Model Ladder
 

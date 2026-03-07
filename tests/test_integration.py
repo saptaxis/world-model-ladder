@@ -99,6 +99,7 @@ def test_multi_step_train_roundtrip(episode_dir, tmp_path):
 
 def test_train_script_smoke(episode_dir, tmp_path):
     """Smoke test: run train.py as a subprocess with tiny config."""
+    import os
     import subprocess
     import sys
 
@@ -113,9 +114,11 @@ def test_train_script_smoke(episode_dir, tmp_path):
     cfg_path = tmp_path / "smoke.yaml"
     config.save(cfg_path)
 
+    project_root = str(Path(__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": project_root}
     result = subprocess.run(
         [sys.executable, "scripts/train.py", "--config", str(cfg_path)],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=60, env=env,
     )
     assert result.returncode == 0, f"train.py failed:\n{result.stderr}"
     assert (tmp_path / "linear-delta-single_step_k1-policy" / "best.pt").exists()
@@ -123,6 +126,7 @@ def test_train_script_smoke(episode_dir, tmp_path):
 
 def test_eval_script_smoke(episode_dir, tmp_path):
     """Smoke test: train then eval as subprocesses."""
+    import os
     import subprocess
     import sys
 
@@ -137,10 +141,13 @@ def test_eval_script_smoke(episode_dir, tmp_path):
     cfg_path = tmp_path / "smoke.yaml"
     config.save(cfg_path)
 
+    project_root = str(Path(__file__).resolve().parent.parent)
+    env = {**os.environ, "PYTHONPATH": project_root}
+
     # Train
     subprocess.run(
         [sys.executable, "scripts/train.py", "--config", str(cfg_path)],
-        capture_output=True, text=True, timeout=60, check=True,
+        capture_output=True, text=True, timeout=60, check=True, env=env,
     )
 
     ckpt = tmp_path / "linear-delta-single_step_k1-policy" / "best.pt"
@@ -149,7 +156,7 @@ def test_eval_script_smoke(episode_dir, tmp_path):
     # Eval
     result = subprocess.run(
         [sys.executable, "scripts/eval.py", "--checkpoint", str(ckpt)],
-        capture_output=True, text=True, timeout=60,
+        capture_output=True, text=True, timeout=60, env=env,
     )
     assert result.returncode == 0, f"eval.py failed:\n{result.stderr}"
     metrics_json = ckpt.parent / "eval" / "metrics.json"
