@@ -23,6 +23,7 @@ class RunConfig:
     sampling_start: float = 0.0
     sampling_end: float = 0.5
     curriculum: bool = False
+    kl_weight: float = 1.0              # KL weight for ELBO loss
 
     # Data
     data_mix: str = "policy"            # "policy" | "policy_primitives"

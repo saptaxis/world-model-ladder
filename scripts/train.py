@@ -19,6 +19,7 @@ from data.loader import EpisodeDataset
 from data.normalization import compute_norm_stats
 from models.factory import build_model
 from training.loop import train_epoch, validate
+from training.scheduling import curriculum_schedule, sampling_schedule
 from utils.checkpoint import save_checkpoint
 from utils.config import RunConfig, load_config, generate_run_name
 from utils.logging import TrainLogger, DIM_NAMES_8D
@@ -33,6 +34,7 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--suffix", type=str, default=None)
+    parser.add_argument("--kl_weight", type=float, default=None)
     parser.add_argument("--device", type=str, default=None)
     return parser.parse_args()
 
@@ -42,7 +44,7 @@ def main():
 
     # Build overrides dict from non-None CLI args
     overrides = {}
-    for field in ["rollout_k", "lr", "batch_size", "epochs", "suffix"]:
+    for field in ["rollout_k", "lr", "batch_size", "epochs", "suffix", "kl_weight"]:
         val = getattr(args, field)
         if val is not None:
             overrides[field] = val
@@ -94,15 +96,28 @@ def main():
     # Training
     best_val_loss = float("inf")
     for epoch in range(config.epochs):
+        # Compute schedule values
+        current_k = config.rollout_k
+        current_sampling_prob = 0.0
+        if config.curriculum:
+            current_k = curriculum_schedule(epoch, config.epochs,
+                                            k_min=1, k_max=config.rollout_k)
+        if config.training_mode == "scheduled_sampling":
+            current_sampling_prob = sampling_schedule(
+                epoch, config.epochs,
+                start=config.sampling_start, end=config.sampling_end)
+
         train_metrics = train_epoch(
             model, train_loader, optimizer, norm_stats,
-            training_mode=config.training_mode, rollout_k=config.rollout_k,
-            device=device,
+            training_mode=config.training_mode, rollout_k=current_k,
+            device=device, sampling_prob=current_sampling_prob,
+            kl_weight=config.kl_weight,
         )
         val_metrics = validate(
             model, val_loader, norm_stats,
-            training_mode=config.training_mode, rollout_k=config.rollout_k,
-            device=device,
+            training_mode=config.training_mode, rollout_k=current_k,
+            device=device, sampling_prob=current_sampling_prob,
+            kl_weight=config.kl_weight,
         )
 
         logger.log_scalar("train/loss", train_metrics["train_loss"], epoch)

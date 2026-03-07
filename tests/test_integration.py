@@ -161,3 +161,27 @@ def test_eval_script_smoke(episode_dir, tmp_path):
     assert result.returncode == 0, f"eval.py failed:\n{result.stderr}"
     metrics_json = ckpt.parent / "eval" / "metrics.json"
     assert metrics_json.exists()
+
+
+def test_gru_multi_step_integration(episode_dir, tmp_path):
+    """End-to-end: train GRU with multi-step loss."""
+    config = RunConfig(
+        arch="gru", arch_params={"hidden_dim": 16},
+        prediction="delta", training_mode="multi_step",
+        rollout_k=5, data_mix="policy", data_path=str(episode_dir),
+        state_dim=8, action_dim=2,
+        lr=1e-3, batch_size=8, epochs=2, seq_len=10,
+        val_fraction=0.2, run_dir=str(tmp_path),
+    )
+    train_ds = EpisodeDataset(config.data_path, state_dim=8, mode="sequence",
+                              seq_len=10, split="train", val_fraction=0.2)
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, drop_last=True)
+    norm_stats = compute_norm_stats(train_ds.episode_dicts())
+    model = build_model(config)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+    for epoch in range(2):
+        metrics = train_epoch(model, train_loader, optimizer, norm_stats,
+                              training_mode="multi_step", rollout_k=5)
+    assert metrics["train_loss"] > 0
+    assert metrics["train_loss"] < 1000
