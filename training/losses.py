@@ -62,3 +62,50 @@ def multi_step_loss(model, batch, norm_stats: NormStats, k: int) -> torch.Tensor
     pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
 
     return F.mse_loss(pred_deltas_n, true_deltas_n)
+
+
+def scheduled_sampling_loss(model, batch, norm_stats: NormStats,
+                            k: int, sampling_prob: float) -> torch.Tensor:
+    """MSE on k-step rollout with scheduled sampling.
+
+    Like multi_step_loss but at each step, with probability sampling_prob,
+    the model uses its own predicted state instead of the true state.
+    Uses teacher-forced true states otherwise. Rolls out in raw space.
+
+    Only meaningful for recurrent models — the hidden state evolves
+    regardless of whether the state input is true or predicted.
+
+    Args:
+        batch: (state_seq, action_seq) where state_seq is [batch, T+1, state_dim]
+        norm_stats: normalization statistics
+        k: number of rollout steps
+        sampling_prob: probability of using model's own prediction (0=teacher forced)
+    """
+    state_seq, action_seq = batch
+    s0 = state_seq[:, 0]
+    actions_k = action_seq[:, :k]
+    true_states_k = state_seq[:, :k + 1]
+
+    pred_deltas_raw = []
+    s = s0
+    model_state = model.initial_state(s0.shape[0], device=s0.device)
+
+    for t in range(k):
+        s_n = normalize(s, norm_stats.state_mean, norm_stats.state_std)
+        delta_n, model_state = model.step(s_n, actions_k[:, t], model_state)
+        delta_raw = denormalize(delta_n, norm_stats.delta_mean, norm_stats.delta_std)
+        s_pred = s + delta_raw
+        pred_deltas_raw.append(delta_raw)
+
+        # Next input: true state or model prediction
+        if t + 1 < k:
+            use_pred = torch.rand(1).item() < sampling_prob
+            s = s_pred if use_pred else true_states_k[:, t + 1]
+
+    pred_deltas_raw = torch.stack(pred_deltas_raw, dim=1)
+
+    true_deltas = true_states_k[:, 1:] - true_states_k[:, :-1]
+    true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
+    pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
+
+    return F.mse_loss(pred_deltas_n, true_deltas_n)

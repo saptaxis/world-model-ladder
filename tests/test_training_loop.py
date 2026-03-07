@@ -62,3 +62,16 @@ def test_train_epoch_gru_multi_step(episode_dir):
                           training_mode="multi_step", rollout_k=5)
     assert metrics["train_loss"] > 0
     assert metrics["train_loss"] < 1000
+
+
+def test_train_epoch_scheduled_sampling(episode_dir):
+    ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    loader = DataLoader(ds, batch_size=8, shuffle=True, drop_last=True)
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    norm_stats = compute_norm_stats(ds.episode_dicts())
+    metrics = train_epoch(model, loader, optimizer, norm_stats,
+                          training_mode="scheduled_sampling",
+                          rollout_k=5, sampling_prob=0.3)
+    assert metrics["train_loss"] > 0
+    assert metrics["train_loss"] < 1000

@@ -4,12 +4,13 @@ from __future__ import annotations
 import torch
 
 from data.normalization import NormStats
-from training.losses import single_step_loss, multi_step_loss
+from training.losses import single_step_loss, multi_step_loss, scheduled_sampling_loss
 
 
 def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
                 training_mode: str = "single_step", rollout_k: int = 1,
-                device: str = "cpu", max_grad_norm: float = 1.0) -> dict:
+                device: str = "cpu", max_grad_norm: float = 1.0,
+                sampling_prob: float = 0.0) -> dict:
     """Run one training epoch.
 
     Args:
@@ -37,11 +38,13 @@ def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
             loss = single_step_loss(model, batch, ns)
         elif training_mode == "multi_step":
             loss = multi_step_loss(model, batch, ns, k=rollout_k)
+        elif training_mode == "scheduled_sampling":
+            loss = scheduled_sampling_loss(model, batch, ns, k=rollout_k,
+                                           sampling_prob=sampling_prob)
         else:
             raise ValueError(
                 f"Unsupported training_mode: {training_mode}. "
-                f"Available: single_step, multi_step. "
-                f"(scheduled_sampling requires GRU — not yet implemented)"
+                f"Available: single_step, multi_step, scheduled_sampling"
             )
 
         optimizer.zero_grad()
@@ -58,7 +61,7 @@ def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
 @torch.no_grad()
 def validate(model, val_loader, norm_stats: NormStats,
              training_mode: str = "single_step", rollout_k: int = 1,
-             device: str = "cpu") -> dict:
+             device: str = "cpu", sampling_prob: float = 0.0) -> dict:
     """Run validation. Same loss computation as training, no gradient."""
     model.eval()
     total_loss = 0.0
@@ -72,11 +75,13 @@ def validate(model, val_loader, norm_stats: NormStats,
             loss = single_step_loss(model, batch, ns)
         elif training_mode == "multi_step":
             loss = multi_step_loss(model, batch, ns, k=rollout_k)
+        elif training_mode == "scheduled_sampling":
+            loss = scheduled_sampling_loss(model, batch, ns, k=rollout_k,
+                                           sampling_prob=sampling_prob)
         else:
             raise ValueError(
                 f"Unsupported training_mode: {training_mode}. "
-                f"Available: single_step, multi_step. "
-                f"(scheduled_sampling requires GRU — not yet implemented)"
+                f"Available: single_step, multi_step, scheduled_sampling"
             )
 
         total_loss += loss.item()

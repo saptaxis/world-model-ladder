@@ -135,3 +135,54 @@ def test_multi_step_loss_gru():
     loss.backward()
     for name, p in model.named_parameters():
         assert p.grad is not None, f"No gradient for {name}"
+
+
+from training.losses import scheduled_sampling_loss
+
+
+def test_scheduled_sampling_loss_finite():
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    state_seq = torch.randn(4, 11, 8)
+    action_seq = torch.randn(4, 10, 2)
+    batch = (state_seq, action_seq)
+    loss = scheduled_sampling_loss(model, batch, _make_norm_stats(),
+                                   k=5, sampling_prob=0.3)
+    assert loss.isfinite()
+    assert loss.item() > 0
+
+
+def test_scheduled_sampling_loss_backward():
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    state_seq = torch.randn(4, 11, 8)
+    action_seq = torch.randn(4, 10, 2)
+    batch = (state_seq, action_seq)
+    loss = scheduled_sampling_loss(model, batch, _make_norm_stats(),
+                                   k=5, sampling_prob=0.3)
+    loss.backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"
+
+
+def test_scheduled_sampling_prob0_vs_multi_step():
+    """With sampling_prob=0 (teacher-forced input) vs multi-step (open-loop input).
+
+    These differ because multi_step feeds predicted states back while
+    scheduled_sampling with prob=0 feeds true states. Both should produce
+    finite losses. With GRU, both thread model_state.
+    """
+    torch.manual_seed(42)
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    model.eval()
+    state_seq = torch.randn(4, 6, 8)
+    action_seq = torch.randn(4, 5, 2)
+    batch = (state_seq, action_seq)
+    ns = _make_norm_stats()
+    with torch.no_grad():
+        ms_loss = multi_step_loss(model, batch, ns, k=5)
+        ss_loss = scheduled_sampling_loss(model, batch, ns, k=5, sampling_prob=0.0)
+    assert ms_loss.isfinite()
+    assert ss_loss.isfinite()
+    # They should differ because the state inputs differ (open-loop vs teacher-forced)
+    # but both should be reasonable
+    assert ms_loss.item() < 1000
+    assert ss_loss.item() < 1000
