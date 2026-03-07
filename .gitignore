@@ -10,3 +10,4 @@ data/
 checkpoints/
 *.npz
 .DS_Store
+scad-*.yml
