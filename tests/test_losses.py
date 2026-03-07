@@ -114,3 +114,24 @@ def test_multi_step_loss_threads_model_state():
     # These should differ because GRU hidden state evolves
     assert not torch.allclose(loss, loss_no_state), \
         "multi_step_loss should thread model_state for recurrent models"
+
+
+def test_single_step_loss_gru():
+    """Single-step loss works with GRU (ignores hidden state)."""
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    batch = (torch.randn(16, 8), torch.randn(16, 2), torch.randn(16, 8))
+    loss = single_step_loss(model, batch, _make_norm_stats())
+    assert loss.isfinite()
+
+
+def test_multi_step_loss_gru():
+    """Multi-step loss works with GRU, gradients flow through hidden state chain."""
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    state_seq = torch.randn(4, 11, 8)
+    action_seq = torch.randn(4, 10, 2)
+    batch = (state_seq, action_seq)
+    loss = multi_step_loss(model, batch, _make_norm_stats(), k=5)
+    assert loss.isfinite()
+    loss.backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"

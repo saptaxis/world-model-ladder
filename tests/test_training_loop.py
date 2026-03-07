@@ -47,3 +47,18 @@ def test_validate(episode_dir):
     metrics = validate(model, loader, ns, training_mode="single_step", rollout_k=1)
     assert "val_loss" in metrics
     assert metrics["val_loss"] > 0
+
+
+from models.gru import GRUModel
+
+
+def test_train_epoch_gru_multi_step(episode_dir):
+    ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    loader = DataLoader(ds, batch_size=8, shuffle=True, drop_last=True)
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    norm_stats = compute_norm_stats(ds.episode_dicts())
+    metrics = train_epoch(model, loader, optimizer, norm_stats,
+                          training_mode="multi_step", rollout_k=5)
+    assert metrics["train_loss"] > 0
+    assert metrics["train_loss"] < 1000
