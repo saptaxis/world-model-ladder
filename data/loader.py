@@ -43,7 +43,7 @@ class EpisodeDataset(Dataset):
         self.seq_len = seq_len
 
         # Load all .npz files sorted for deterministic ordering
-        npz_paths = sorted(Path(data_path).glob("*.npz"))
+        npz_paths = sorted(Path(data_path).glob("**/*.npz"))
         if not npz_paths:
             raise FileNotFoundError(f"No .npz files in {data_path}")
 
