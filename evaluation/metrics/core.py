@@ -35,9 +35,10 @@ def _rollout_raw_space(model, s0, actions, norm_stats):
     """
     states = [s0]
     s = s0
+    model_state = None
     for t in range(actions.shape[1]):
         s_n = normalize(s, norm_stats.state_mean, norm_stats.state_std)
-        delta_n, _ = model.step(s_n, actions[:, t])
+        delta_n, model_state = model.step(s_n, actions[:, t], model_state)
         delta = denormalize(delta_n, norm_stats.delta_mean, norm_stats.delta_std)
         s = s + delta
         states.append(s)

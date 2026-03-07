@@ -47,9 +47,10 @@ def multi_step_loss(model, batch, norm_stats: NormStats, k: int) -> torch.Tensor
     # Rollout in raw space with normalize/denormalize at each step
     pred_deltas_raw = []
     s = s0
+    model_state = None
     for t in range(k):
         s_n = normalize(s, norm_stats.state_mean, norm_stats.state_std)
-        delta_n, _ = model.step(s_n, actions_k[:, t])
+        delta_n, model_state = model.step(s_n, actions_k[:, t], model_state)
         delta_raw = denormalize(delta_n, norm_stats.delta_mean, norm_stats.delta_std)
         s = s + delta_raw
         pred_deltas_raw.append(delta_raw)
