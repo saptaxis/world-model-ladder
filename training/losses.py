@@ -109,3 +109,51 @@ def scheduled_sampling_loss(model, batch, norm_stats: NormStats,
     pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
 
     return F.mse_loss(pred_deltas_n, true_deltas_n)
+
+
+def elbo_loss(model, batch, norm_stats: NormStats, k: int,
+              kl_weight: float = 1.0) -> torch.Tensor:
+    """ELBO loss for RSSM: reconstruction + KL divergence.
+
+    Reconstruction: same as multi_step_loss but passing model_state through
+    so the RSSM accumulates posterior information.
+
+    KL: averaged over all timesteps.
+
+    Args:
+        model: RSSM model (must have kl_loss method)
+        batch: (state_seq, action_seq)
+        norm_stats: normalization statistics
+        k: number of rollout steps
+        kl_weight: weight for KL term (beta in beta-VAE)
+    """
+    state_seq, action_seq = batch
+    s0 = state_seq[:, 0]
+    actions_k = action_seq[:, :k]
+    true_states_k = state_seq[:, :k + 1]
+
+    pred_deltas_raw = []
+    kl_terms = []
+    s = s0
+    model_state = model.initial_state(s0.shape[0], device=s0.device)
+
+    for t in range(k):
+        s_n = normalize(s, norm_stats.state_mean, norm_stats.state_std)
+        delta_n, model_state = model.step(s_n, actions_k[:, t], model_state)
+        delta_raw = denormalize(delta_n, norm_stats.delta_mean, norm_stats.delta_std)
+        s = s + delta_raw
+        pred_deltas_raw.append(delta_raw)
+        kl_terms.append(model.kl_loss(model_state))
+
+    pred_deltas_raw = torch.stack(pred_deltas_raw, dim=1)
+
+    # Reconstruction loss in delta-normalized space
+    true_deltas = true_states_k[:, 1:] - true_states_k[:, :-1]
+    true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
+    pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
+    recon_loss = F.mse_loss(pred_deltas_n, true_deltas_n)
+
+    # KL loss averaged over timesteps
+    kl_loss = torch.stack(kl_terms).mean()
+
+    return recon_loss + kl_weight * kl_loss

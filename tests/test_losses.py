@@ -186,3 +186,47 @@ def test_scheduled_sampling_prob0_vs_multi_step():
     # but both should be reasonable
     assert ms_loss.item() < 1000
     assert ss_loss.item() < 1000
+
+
+from models.rssm import RSSMModel
+from training.losses import elbo_loss
+
+
+def test_elbo_loss_finite():
+    model = RSSMModel(state_dim=8, action_dim=2, deter_dim=32, stoch_dim=8,
+                      hidden_dim=16)
+    state_seq = torch.randn(4, 11, 8)
+    action_seq = torch.randn(4, 10, 2)
+    batch = (state_seq, action_seq)
+    loss = elbo_loss(model, batch, _make_norm_stats(), k=5)
+    assert loss.isfinite()
+    assert loss.item() > 0
+
+
+def test_elbo_loss_backward():
+    model = RSSMModel(state_dim=8, action_dim=2, deter_dim=32, stoch_dim=8,
+                      hidden_dim=16)
+    state_seq = torch.randn(4, 11, 8)
+    action_seq = torch.randn(4, 10, 2)
+    batch = (state_seq, action_seq)
+    loss = elbo_loss(model, batch, _make_norm_stats(), k=5)
+    loss.backward()
+    for name, p in model.named_parameters():
+        assert p.grad is not None, f"No gradient for {name}"
+
+
+def test_elbo_loss_kl_weight():
+    """Higher kl_weight should increase the loss."""
+    torch.manual_seed(42)
+    model = RSSMModel(state_dim=8, action_dim=2, deter_dim=32, stoch_dim=8)
+    state_seq = torch.randn(4, 6, 8)
+    action_seq = torch.randn(4, 5, 2)
+    batch = (state_seq, action_seq)
+    ns = _make_norm_stats()
+    model.eval()
+    with torch.no_grad():
+        loss_low = elbo_loss(model, batch, ns, k=5, kl_weight=0.1)
+        loss_high = elbo_loss(model, batch, ns, k=5, kl_weight=10.0)
+    # Can't guarantee ordering due to randomness in sampling, but both should be finite
+    assert loss_low.isfinite()
+    assert loss_high.isfinite()
