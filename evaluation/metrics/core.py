@@ -1,0 +1,138 @@
+"""Core evaluation metrics for world models."""
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from data.normalization import NormStats, normalize, denormalize
+
+
+@torch.no_grad()
+def per_dim_mse(model, data_loader, norm_stats: NormStats,
+                device: str = "cpu") -> torch.Tensor:
+    """1-step per-dimension MSE (Eval A).
+
+    Returns: [state_dim] tensor of per-dimension MSE.
+    """
+    model.eval()
+    all_sq_errors = []
+    for batch in data_loader:
+        obs, actions, true_deltas = (t.to(device) for t in batch)
+        ns = norm_stats.to(device)
+        obs_n = normalize(obs, ns.state_mean, ns.state_std)
+        pred_deltas_n, _ = model.step(obs_n, actions)
+        pred_deltas = denormalize(pred_deltas_n, ns.delta_mean, ns.delta_std)
+        sq_err = (pred_deltas - true_deltas).pow(2)
+        all_sq_errors.append(sq_err.cpu())
+    return torch.cat(all_sq_errors, dim=0).mean(dim=0)
+
+
+def _rollout_raw_space(model, s0, actions, norm_stats):
+    """Open-loop rollout in raw space with proper normalize/denormalize at each step.
+
+    Same as rollout_open_loop but handles the normalization boundary:
+    normalize state for model input, denormalize delta for accumulation.
+    """
+    states = [s0]
+    s = s0
+    for t in range(actions.shape[1]):
+        s_n = normalize(s, norm_stats.state_mean, norm_stats.state_std)
+        delta_n, _ = model.step(s_n, actions[:, t])
+        delta = denormalize(delta_n, norm_stats.delta_mean, norm_stats.delta_std)
+        s = s + delta
+        states.append(s)
+    return torch.stack(states, dim=1)  # [batch, T+1, state_dim]
+
+
+@torch.no_grad()
+def horizon_error_curve(model, dataset, norm_stats: NormStats,
+                        horizons: list[int] = (1, 5, 10, 20, 50, 100),
+                        n_rollouts: int = 50, device: str = "cpu") -> dict:
+    """MSE at each horizon via autoregressive rollout (Eval B).
+
+    Rolls out in raw space (normalize/denormalize at each step) to
+    avoid conflating state and delta normalization.
+
+    Returns: dict mapping horizon -> [state_dim] tensor of per-dim MSE.
+    """
+    model.eval()
+    max_h = max(horizons)
+    ns = norm_stats.to(device)
+
+    step_errors = {h: [] for h in horizons}
+    n_done = 0
+
+    for ep_idx in range(dataset.n_episodes):
+        if n_done >= n_rollouts:
+            break
+        states = torch.from_numpy(dataset.states[ep_idx]).to(device)
+        actions = torch.from_numpy(dataset.actions[ep_idx]).to(device)
+        T = len(actions)
+        if T < max_h:
+            continue
+
+        s0 = states[0].unsqueeze(0)
+        acts = actions[:max_h].unsqueeze(0)
+        pred_states = _rollout_raw_space(model, s0, acts, ns)
+
+        for h in horizons:
+            if h > T:
+                continue
+            pred_raw = pred_states[0, h]
+            true_raw = states[h]
+            sq_err = (pred_raw - true_raw).pow(2)
+            step_errors[h].append(sq_err.cpu())
+
+        n_done += 1
+
+    result = {}
+    for h in horizons:
+        if step_errors[h]:
+            result[h] = torch.stack(step_errors[h]).mean(dim=0)
+        else:
+            result[h] = torch.zeros(norm_stats.state_mean.shape[0])
+    return result
+
+
+def divergence_exponent(horizon_errors: dict) -> float:
+    """Fit lambda in error(h) ~ e^(lambda * h) (Eval B).
+
+    Args:
+        horizon_errors: dict mapping horizon -> scalar mean MSE
+
+    Returns:
+        lambda: divergence rate (higher = faster divergence)
+    """
+    horizons = sorted(horizon_errors.keys())
+    errors = [horizon_errors[h] if isinstance(horizon_errors[h], (int, float))
+              else float(horizon_errors[h].mean()) for h in horizons]
+
+    # Filter out zero/negative errors (can't log)
+    valid = [(h, e) for h, e in zip(horizons, errors) if e > 0]
+    if len(valid) < 2:
+        return 0.0
+
+    h_arr = np.array([v[0] for v in valid], dtype=np.float64)
+    log_err = np.log(np.array([v[1] for v in valid], dtype=np.float64))
+
+    # Least-squares fit: log(error) = lambda * h + c
+    A = np.column_stack([h_arr, np.ones_like(h_arr)])
+    result = np.linalg.lstsq(A, log_err, rcond=None)
+    lam = float(result[0][0])
+    return lam
+
+
+def horizon_to_failure(horizon_errors: dict, threshold: float) -> int:
+    """Steps until mean MSE exceeds threshold (Eval B).
+
+    Returns the last horizon where error is below threshold.
+    """
+    horizons = sorted(horizon_errors.keys())
+    last_good = horizons[0]
+    for h in horizons:
+        err = horizon_errors[h]
+        if isinstance(err, torch.Tensor):
+            err = float(err.mean())
+        if err < threshold:
+            last_good = h
+    return last_good
