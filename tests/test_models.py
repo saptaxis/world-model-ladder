@@ -18,3 +18,31 @@ def test_base_class_step_raises():
         assert False, "Should raise NotImplementedError"
     except NotImplementedError:
         pass
+
+
+from models.linear import LinearModel
+
+
+def test_linear_output_shape():
+    model = LinearModel(state_dim=8, action_dim=2)
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    delta, ms = model.step(obs, action)
+    assert delta.shape == (4, 8)
+    assert ms is None
+
+
+def test_linear_is_world_model():
+    model = LinearModel(state_dim=8, action_dim=2)
+    assert isinstance(model, WorldModel)
+
+
+def test_linear_gradient_flows():
+    model = LinearModel(state_dim=8, action_dim=2)
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    delta, _ = model.step(obs, action)
+    loss = delta.pow(2).mean()
+    loss.backward()
+    assert model.linear.weight.grad is not None
+    assert model.linear.weight.grad.abs().sum() > 0
