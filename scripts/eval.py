@@ -24,6 +24,7 @@ from evaluation.metrics.core import (
 )
 from utils.checkpoint import load_checkpoint
 from utils.logging import DIM_NAMES_8D
+from utils.plotting import plot_horizon_curve, plot_per_dim_bars
 from utils.reporting import generate_eval_report
 
 
@@ -117,6 +118,32 @@ def main():
         output_path=str(report_path),
     )
     print(f"Report saved to: {report_path}")
+
+    # Generate plots
+    plot_dir = eval_dir / "plots"
+    plot_dir.mkdir(exist_ok=True)
+
+    run_label = Path(args.checkpoint).parent.name
+    plot_per_dim_bars(
+        results["per_dim_mse"],
+        str(plot_dir / "per_dim_mse.png"),
+        title=f"Per-Dimension MSE: {run_label}",
+    )
+    print(f"Plot: {plot_dir / 'per_dim_mse.png'}")
+
+    if mean_curves:
+        plot_horizon_curve(
+            mean_curves,
+            str(plot_dir / "horizon_curve.png"),
+            title=f"Horizon Error: {run_label}",
+        )
+        plot_horizon_curve(
+            mean_curves,
+            str(plot_dir / "horizon_curve_log.png"),
+            title=f"Horizon Error (log): {run_label}",
+            log_scale=True,
+        )
+        print(f"Plot: {plot_dir / 'horizon_curve.png'}")
 
 
 if __name__ == "__main__":
