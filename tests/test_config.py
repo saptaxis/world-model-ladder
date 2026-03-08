@@ -71,3 +71,23 @@ def test_validate_config_elbo_with_rssm_ok():
     cfg = RunConfig(arch="rssm", data_path="/tmp/data",
                     training_mode="elbo", rollout_k=5)
     validate_config(cfg)  # should not raise
+
+
+def test_validate_config_rollout_k_exceeds_seq_len():
+    cfg = RunConfig(arch="gru", data_path="/tmp/data",
+                    training_mode="multi_step", rollout_k=60, seq_len=50)
+    with pytest.raises(ValueError, match="rollout_k"):
+        validate_config(cfg)
+
+
+def test_validate_config_rollout_k_within_seq_len_ok():
+    cfg = RunConfig(arch="gru", data_path="/tmp/data",
+                    training_mode="multi_step", rollout_k=50, seq_len=50)
+    validate_config(cfg)  # should not raise
+
+
+def test_validate_config_single_step_skips_rollout_k_check():
+    """single_step mode doesn't use rollout_k, so no check needed."""
+    cfg = RunConfig(arch="mlp", data_path="/tmp/data",
+                    training_mode="single_step", rollout_k=999, seq_len=50)
+    validate_config(cfg)  # should not raise

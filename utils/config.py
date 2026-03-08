@@ -95,6 +95,12 @@ def validate_config(config: RunConfig) -> None:
             f"training_mode='elbo' requires a model with kl_loss() "
             f"(arch must be one of {_KL_ARCHS}, got '{config.arch}')"
         )
+    if config.training_mode in ("multi_step", "scheduled_sampling", "elbo"):
+        if config.rollout_k > config.seq_len:
+            raise ValueError(
+                f"rollout_k ({config.rollout_k}) exceeds seq_len ({config.seq_len}). "
+                f"Multi-step training can only roll out within the available sequence window."
+            )
 
 
 def load_config(path: str, overrides: dict | None = None) -> RunConfig:
