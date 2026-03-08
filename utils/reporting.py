@@ -55,6 +55,12 @@ def generate_eval_report(run_name: str, results: dict,
             sections.append(f"- **Horizon to failure:** {htf}")
         sections.append("")
 
+    if "cumul_horizon_mean_mse" in results:
+        sections.append("## Cumulative Trajectory MSE (Eval B')\n")
+        sections.append("Average MSE across all steps 1..h (not just endpoint).\n")
+        sections.append(format_horizon_table(results["cumul_horizon_mean_mse"]))
+        sections.append("")
+
     if "horizon_curves" in results:
         sections.append("## Per-Dimension Horizon Curves\n")
         for h in sorted(results["horizon_curves"].keys()):

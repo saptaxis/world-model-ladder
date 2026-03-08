@@ -19,6 +19,7 @@ from models.factory import build_model
 from evaluation.metrics.core import (
     per_dim_mse,
     horizon_error_curve,
+    cumulative_trajectory_mse,
     divergence_exponent,
     horizon_to_failure,
 )
@@ -103,6 +104,20 @@ def main():
     htf = horizon_to_failure(mean_curves, threshold=args.failure_threshold)
     results["horizon_to_failure"] = htf
     print(f"  Horizon to failure (threshold={args.failure_threshold}): {htf}")
+
+    # Eval B': cumulative trajectory MSE
+    print("Running Eval B': cumulative trajectory MSE...")
+    cumul_curves = cumulative_trajectory_mse(model, val_ds, norm_stats,
+                                              horizons=horizons,
+                                              n_rollouts=args.n_rollouts,
+                                              device=device)
+    results["cumul_horizon_curves"] = {
+        h: {name: float(cumul_curves[h][i]) for i, name in enumerate(dim_names)}
+        for h in horizons if h in cumul_curves
+    }
+    cumul_mean = {h: float(cumul_curves[h].mean()) for h in horizons if h in cumul_curves}
+    results["cumul_horizon_mean_mse"] = cumul_mean
+    print(f"  Cumulative mean MSE: {cumul_mean}")
 
     # Save results
     results_path = eval_dir / "metrics.json"
