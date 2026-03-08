@@ -1,17 +1,22 @@
 """Training loop for world models."""
 from __future__ import annotations
 
+import time
+
 import torch
 
 from data.normalization import NormStats
 from training.losses import single_step_loss, multi_step_loss, scheduled_sampling_loss, elbo_loss
+from training.profiler import ProfileLogger
 
 
 def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
                 training_mode: str = "single_step", rollout_k: int = 1,
                 device: str = "cpu", max_grad_norm: float = 1.0,
                 sampling_prob: float = 0.0, kl_weight: float = 1.0,
-                ctx=None, callbacks=None) -> dict:
+                ctx=None, callbacks=None,
+                profiler: ProfileLogger | None = None,
+                torch_profiler=None) -> dict:
     """Run one training epoch.
 
     Args:
@@ -27,6 +32,8 @@ def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
         kl_weight: weight for KL divergence term (ELBO)
         ctx: optional CallbackContext (updated in-place with global_step)
         callbacks: optional list of TrainCallback (dispatched per step)
+        profiler: optional ProfileLogger for phase-level timing
+        torch_profiler: optional torch.profiler.profile for GPU kernel traces
 
     Returns:
         dict with "train_loss" (mean over batches), "stop_requested" (bool)
@@ -39,43 +46,75 @@ def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
     # Cache normalized stats on device once — avoids per-batch tensor allocation
     ns = norm_stats.to(device)
 
-    for batch in train_loader:
-        batch = tuple(t.to(device) for t in batch)
+    _prof = profiler or ProfileLogger(None)
 
-        if training_mode == "single_step":
-            loss = single_step_loss(model, batch, ns)
-        elif training_mode == "multi_step":
-            loss = multi_step_loss(model, batch, ns, k=rollout_k)
-        elif training_mode == "scheduled_sampling":
-            loss = scheduled_sampling_loss(model, batch, ns, k=rollout_k,
-                                           sampling_prob=sampling_prob)
-        elif training_mode == "elbo":
-            loss = elbo_loss(model, batch, ns, k=rollout_k, kl_weight=kl_weight)
-        else:
-            raise ValueError(
-                f"Unsupported training_mode: {training_mode}. "
-                f"Available: single_step, multi_step, scheduled_sampling, elbo"
-            )
+    def _step():
+        return ctx.global_step if ctx else 0
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    def _epoch():
+        return ctx.epoch if ctx else 0
+
+    batch_iter = iter(train_loader)
+    while True:
+        # Time the dataloader iteration separately
+        t0_dl = time.perf_counter() if _prof.enabled else 0
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            break
+        if _prof.enabled:
+            _prof.log_event("dataloader",
+                            dur_ms=round((time.perf_counter() - t0_dl) * 1000, 4),
+                            step=_step(), epoch=_epoch())
+
+        # Increment step FIRST so all phases within this step log the same step number
+        if ctx is not None:
+            ctx.global_step += 1
+
+        with _prof.phase("data_to_device", step=_step(), epoch=_epoch()):
+            batch = tuple(t.to(device) for t in batch)
+
+        with _prof.phase("forward", step=_step(), epoch=_epoch()):
+            if training_mode == "single_step":
+                loss = single_step_loss(model, batch, ns)
+            elif training_mode == "multi_step":
+                loss = multi_step_loss(model, batch, ns, k=rollout_k)
+            elif training_mode == "scheduled_sampling":
+                loss = scheduled_sampling_loss(model, batch, ns, k=rollout_k,
+                                               sampling_prob=sampling_prob)
+            elif training_mode == "elbo":
+                loss = elbo_loss(model, batch, ns, k=rollout_k, kl_weight=kl_weight)
+            else:
+                raise ValueError(
+                    f"Unsupported training_mode: {training_mode}. "
+                    f"Available: single_step, multi_step, scheduled_sampling, elbo"
+                )
+
+        with _prof.phase("backward", step=_step(), epoch=_epoch()):
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
 
         # Dispatch on_step callbacks AFTER backward+clip, BEFORE optimizer.step()
         if ctx is not None and callbacks:
-            ctx.global_step += 1
             ctx.extras["train_loss_step"] = loss.item()
-            if ctx.writer:
-                ctx.writer.add_scalar("train/loss", loss.item(), ctx.global_step)
+            with _prof.phase("tb_logging", step=_step(), epoch=_epoch()):
+                if ctx.writer:
+                    ctx.writer.add_scalar("train/loss", loss.item(), ctx.global_step)
             for cb in callbacks:
-                if cb.on_step(ctx) is False:
-                    stop_requested = True
-                    break
+                with _prof.phase(f"cb/{type(cb).__name__}", step=_step(), epoch=_epoch()):
+                    if cb.on_step(ctx) is False:
+                        stop_requested = True
+                        break
 
-        optimizer.step()
+        with _prof.phase("optimizer", step=_step(), epoch=_epoch()):
+            optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
+
+        if torch_profiler is not None:
+            torch_profiler.step()
 
         if stop_requested:
             break
