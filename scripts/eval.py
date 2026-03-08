@@ -24,6 +24,7 @@ from evaluation.metrics.core import (
 )
 from utils.checkpoint import load_checkpoint
 from utils.logging import DIM_NAMES_8D
+from utils.reporting import generate_eval_report
 
 
 def parse_args():
@@ -107,6 +108,15 @@ def main():
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to: {results_path}")
+
+    # Generate markdown report
+    report_path = eval_dir / "report.md"
+    generate_eval_report(
+        run_name=Path(args.checkpoint).parent.name,
+        results=results,
+        output_path=str(report_path),
+    )
+    print(f"Report saved to: {report_path}")
 
 
 if __name__ == "__main__":
