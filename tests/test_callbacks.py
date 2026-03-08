@@ -285,6 +285,32 @@ def test_rollout_metrics_callback(tmp_path, episode_dir):
         assert isinstance(ctx.extras["horizon_errors"][h], float)
 
 
+def test_rollout_metrics_callback_logs_cumulative(tmp_path, episode_dir):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[16])
+    optimizer = torch.optim.Adam(model.parameters())
+    writer = SummaryWriter(log_dir=str(tmp_path / "tb"))
+
+    val_ds = EpisodeDataset(episode_dir, state_dim=8)
+    norm_stats = compute_norm_stats(val_ds.episode_dicts())
+
+    cb = RolloutMetricsCallback(
+        dataset=val_ds,
+        norm_stats=norm_stats,
+        horizons=[1, 5],
+        every_n_steps=1,
+        n_rollouts=3,
+    )
+
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=writer,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu",
+    )
+    cb.on_step(ctx)
+    assert "cumul_horizon_errors" in ctx.extras
+
+    writer.close()
+
+
 def test_rollout_metrics_callback_skip_step_0(tmp_path):
     # Minimal dataset not needed because step 0 should be skipped
     model = MLPModel(state_dim=4, action_dim=2, hidden_dims=[16])

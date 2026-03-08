@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 from data.normalization import NormStats, normalize, denormalize
-from evaluation.metrics.core import per_dim_mse, horizon_error_curve
+from evaluation.metrics.core import per_dim_mse, horizon_error_curve, cumulative_trajectory_mse
 from training.loop import validate
 from utils.checkpoint import save_checkpoint
 from utils.plotting import export_plots
@@ -213,6 +213,15 @@ class RolloutMetricsCallback(TrainCallback):
         if ctx.writer:
             for h, err_tensor in curves.items():
                 ctx.writer.add_scalar(f"rollout/mse_h{h:02d}", float(err_tensor.mean()), ctx.global_step)
+        cumul = cumulative_trajectory_mse(
+            ctx.model, self.dataset, self.norm_stats,
+            horizons=self.horizons, n_rollouts=self.n_rollouts,
+            device=ctx.device,
+        )
+        ctx.extras["cumul_horizon_errors"] = {h: float(v.mean()) for h, v in cumul.items()}
+        if ctx.writer:
+            for h, err_tensor in cumul.items():
+                ctx.writer.add_scalar(f"rollout/cumul_h{h:02d}", float(err_tensor.mean()), ctx.global_step)
         return True
 
 
