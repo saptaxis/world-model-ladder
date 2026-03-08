@@ -15,10 +15,10 @@ def per_dim_mse(model, data_loader, norm_stats: NormStats,
     Returns: [state_dim] tensor of per-dimension MSE.
     """
     model.eval()
+    ns = norm_stats.to(device)
     all_sq_errors = []
     for batch in data_loader:
         obs, actions, true_deltas = (t.to(device) for t in batch)
-        ns = norm_stats.to(device)
         obs_n = normalize(obs, ns.state_mean, ns.state_std)
         pred_deltas_n, _ = model.step(obs_n, actions)
         pred_deltas = denormalize(pred_deltas_n, ns.delta_mean, ns.delta_std)
@@ -146,6 +146,65 @@ def cumulative_trajectory_mse(model, dataset, norm_stats: NormStats,
         else:
             result[h] = torch.zeros(norm_stats.state_mean.shape[0])
     return result
+
+
+@torch.no_grad()
+def rollout_error_metrics(model, dataset, norm_stats: NormStats,
+                          horizons: list[int] = (1, 5, 10, 20, 50),
+                          n_rollouts: int = 50, device: str = "cpu") -> tuple[dict, dict]:
+    """Combined endpoint and cumulative trajectory MSE from one rollout pass.
+
+    Does the same rollouts as horizon_error_curve + cumulative_trajectory_mse
+    but only runs the model once per episode instead of twice.
+
+    Returns:
+        (endpoint_errors, cumulative_errors): each maps horizon -> [state_dim] tensor.
+    """
+    model.eval()
+    max_h = max(horizons)
+    ns = norm_stats.to(device)
+
+    endpoint_errs = {h: [] for h in horizons}
+    cumul_errs = {h: [] for h in horizons}
+    n_done = 0
+
+    for ep_idx in range(dataset.n_episodes):
+        if n_done >= n_rollouts:
+            break
+        states = torch.from_numpy(dataset.states[ep_idx]).to(device)
+        actions = torch.from_numpy(dataset.actions[ep_idx]).to(device)
+        T = len(actions)
+        if T < max_h:
+            continue
+
+        s0 = states[0].unsqueeze(0)
+        acts = actions[:max_h].unsqueeze(0)
+        pred_states = _rollout_raw_space(model, s0, acts, ns)
+
+        for h in horizons:
+            if h > T:
+                continue
+            # Endpoint MSE at step h
+            sq_err = (pred_states[0, h] - states[h]).pow(2)
+            endpoint_errs[h].append(sq_err.cpu())
+            # Cumulative MSE averaged across steps 1..h
+            step_sq = torch.stack(
+                [(pred_states[0, t] - states[t]).pow(2) for t in range(1, h + 1)]
+            )
+            cumul_errs[h].append(step_sq.mean(dim=0).cpu())
+
+        n_done += 1
+
+    def _agg(d):
+        result = {}
+        for h in horizons:
+            if d[h]:
+                result[h] = torch.stack(d[h]).mean(dim=0)
+            else:
+                result[h] = torch.zeros(norm_stats.state_mean.shape[0])
+        return result
+
+    return _agg(endpoint_errs), _agg(cumul_errs)
 
 
 def divergence_exponent(horizon_errors: dict) -> float:

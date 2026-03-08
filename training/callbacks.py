@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.optim import Optimizer
 
 from data.normalization import NormStats, normalize, denormalize
-from evaluation.metrics.core import per_dim_mse, horizon_error_curve, cumulative_trajectory_mse
+from evaluation.metrics.core import per_dim_mse, rollout_error_metrics
 from training.loop import validate
 from utils.checkpoint import save_checkpoint
 from utils.plotting import export_plots
@@ -88,14 +88,20 @@ class ValidationCallback(TrainCallback):
             return True
         self.last_val_step = ctx.global_step
 
+        # For single-step mode, compute per-dim MSE in the same forward pass
+        # so PerDimLossCallback can skip its redundant data iteration
         val_metrics = validate(
             ctx.model, self.val_loader, self.norm_stats,
             training_mode=self.training_mode, rollout_k=self.rollout_k,
             device=ctx.device, sampling_prob=self.sampling_prob,
             kl_weight=self.kl_weight,
+            compute_per_dim=(self.training_mode == "single_step"),
         )
         val_loss = val_metrics["val_loss"]
         ctx.extras["val_loss"] = val_loss
+        if "per_dim_mse" in val_metrics:
+            ctx.extras["per_dim_mse"] = val_metrics["per_dim_mse"].tolist()
+            ctx.extras["_per_dim_step"] = ctx.global_step
 
         if ctx.writer:
             ctx.writer.add_scalar("val/loss", val_loss, ctx.global_step)
@@ -180,12 +186,21 @@ class PerDimLossCallback(TrainCallback):
     def on_step(self, ctx):
         if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
             return True
-        pdm = per_dim_mse(ctx.model, self.val_loader, self.norm_stats, device=ctx.device)
-        ctx.extras["per_dim_mse"] = pdm.tolist()
+
+        # Skip if ValidationCallback already computed per-dim MSE this step
+        # (happens in single-step mode where both metrics share a forward pass)
+        if ctx.extras.get("_per_dim_step") == ctx.global_step:
+            pdm = ctx.extras["per_dim_mse"]
+        else:
+            pdm = per_dim_mse(ctx.model, self.val_loader, self.norm_stats, device=ctx.device)
+            pdm = pdm.tolist()
+            ctx.extras["per_dim_mse"] = pdm
+
         names = self.dim_names or [f"dim_{i}" for i in range(len(pdm))]
         if ctx.writer:
             for i, name in enumerate(names[:len(pdm)]):
-                ctx.writer.add_scalar(f"loss_dim/{name}", pdm[i].item(), ctx.global_step)
+                val = pdm[i] if isinstance(pdm[i], float) else pdm[i].item()
+                ctx.writer.add_scalar(f"loss_dim/{name}", val, ctx.global_step)
         return True
 
 
@@ -204,22 +219,17 @@ class RolloutMetricsCallback(TrainCallback):
     def on_step(self, ctx):
         if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
             return True
-        curves = horizon_error_curve(
+        # Single rollout pass computes both endpoint and cumulative MSE
+        endpoint, cumul = rollout_error_metrics(
             ctx.model, self.dataset, self.norm_stats,
             horizons=self.horizons, n_rollouts=self.n_rollouts,
             device=ctx.device,
         )
-        ctx.extras["horizon_errors"] = {h: float(v.mean()) for h, v in curves.items()}
-        if ctx.writer:
-            for h, err_tensor in curves.items():
-                ctx.writer.add_scalar(f"rollout/mse_h{h:02d}", float(err_tensor.mean()), ctx.global_step)
-        cumul = cumulative_trajectory_mse(
-            ctx.model, self.dataset, self.norm_stats,
-            horizons=self.horizons, n_rollouts=self.n_rollouts,
-            device=ctx.device,
-        )
+        ctx.extras["horizon_errors"] = {h: float(v.mean()) for h, v in endpoint.items()}
         ctx.extras["cumul_horizon_errors"] = {h: float(v.mean()) for h, v in cumul.items()}
         if ctx.writer:
+            for h, err_tensor in endpoint.items():
+                ctx.writer.add_scalar(f"rollout/mse_h{h:02d}", float(err_tensor.mean()), ctx.global_step)
             for h, err_tensor in cumul.items():
                 ctx.writer.add_scalar(f"rollout/cumul_h{h:02d}", float(err_tensor.mean()), ctx.global_step)
         return True
@@ -300,12 +310,12 @@ class PerTimestepLossCallback(TrainCallback):
 
         ctx.model.eval()
         all_sq_errors = []
+        ns = self.norm_stats.to(ctx.device)
 
         with torch.no_grad():
             for batch in self.val_loader:
                 batch = tuple(t.to(ctx.device) for t in batch)
                 state_seq, action_seq = batch
-                ns = self.norm_stats.to(ctx.device)
 
                 s = state_seq[:, 0]
                 model_state = None
