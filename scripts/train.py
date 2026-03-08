@@ -36,7 +36,7 @@ from training.callbacks import (
 )
 from training.loop import train_epoch
 from training.scheduling import curriculum_schedule, sampling_schedule
-from utils.checkpoint import load_checkpoint
+from utils.checkpoint import load_checkpoint, get_git_hash
 from utils.config import RunConfig, load_config, generate_run_name
 
 
@@ -96,9 +96,12 @@ def main():
     config.save(run_dir / "config.yaml")
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    git_hash = get_git_hash()
     print(f"Run: {run_name}")
     print(f"Device: {device}")
     print(f"Output: {run_dir}")
+    if git_hash:
+        print(f"Git: {git_hash[:8]}")
 
     # Data
     data_mode = "single_step" if config.training_mode == "single_step" else "sequence"
@@ -149,6 +152,9 @@ def main():
         start_epoch = ckpt.get("epoch", 0) + 1
         start_step = ckpt.get("global_step", 0)
         print(f"Resumed from {args.resume} (epoch={start_epoch}, step={start_step})")
+        ckpt_hash = ckpt.get("git_hash")
+        if ckpt_hash and git_hash and ckpt_hash != git_hash:
+            print(f"WARNING: checkpoint saved at {ckpt_hash[:8]}, current code is {git_hash[:8]}")
 
     # Logging
     tb_dir = str(run_dir / "tb")

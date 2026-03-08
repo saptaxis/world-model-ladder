@@ -2,12 +2,27 @@
 from __future__ import annotations
 
 import dataclasses
+import subprocess
 from pathlib import Path
 
 import torch
 
 from data.normalization import NormStats
 from utils.config import RunConfig
+
+
+def get_git_hash() -> str | None:
+    """Return current git commit hash, or None if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def save_checkpoint(path, model, optimizer, norm_stats: NormStats,
@@ -25,6 +40,9 @@ def save_checkpoint(path, model, optimizer, norm_stats: NormStats,
     }
     if global_step is not None:
         ckpt["global_step"] = global_step
+    git_hash = get_git_hash()
+    if git_hash:
+        ckpt["git_hash"] = git_hash
     torch.save(ckpt, path)
 
 
