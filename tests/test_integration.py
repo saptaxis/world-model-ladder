@@ -110,6 +110,7 @@ def test_train_script_smoke(episode_dir, tmp_path):
         state_dim=8, action_dim=2,
         lr=1e-3, batch_size=16, epochs=2,
         val_fraction=0.2, run_dir=str(tmp_path),
+        val_every=1, patience=100,
     )
     cfg_path = tmp_path / "smoke.yaml"
     config.save(cfg_path)
@@ -137,6 +138,7 @@ def test_eval_script_smoke(episode_dir, tmp_path):
         state_dim=8, action_dim=2,
         lr=1e-3, batch_size=16, epochs=2,
         val_fraction=0.2, run_dir=str(tmp_path),
+        val_every=1, patience=100,
     )
     cfg_path = tmp_path / "smoke.yaml"
     config.save(cfg_path)

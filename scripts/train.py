@@ -4,10 +4,12 @@
 Usage:
     python scripts/train.py --config configs/examples/mlp-single-step.yaml
     python scripts/train.py --config configs/examples/mlp-single-step.yaml --rollout_k 10 --suffix k10
+    python scripts/train.py --resume runs/mlp-delta-single_step_k1-policy/best.pt
 """
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
 from pathlib import Path
 
@@ -18,11 +20,24 @@ from torch.utils.tensorboard import SummaryWriter
 from data.loader import EpisodeDataset
 from data.normalization import compute_norm_stats
 from models.factory import build_model
-from training.loop import train_epoch, validate
+from training.callbacks import (
+    CallbackContext,
+    CheckpointCallback,
+    GradNormCallback,
+    HiddenStateHealthCallback,
+    NaNDetectionCallback,
+    PerDimLossCallback,
+    PerTimestepLossCallback,
+    PlotExportCallback,
+    ProgressCallback,
+    RolloutMetricsCallback,
+    ValidationCallback,
+    WarmupRolloutCallback,
+)
+from training.loop import train_epoch
 from training.scheduling import curriculum_schedule, sampling_schedule
-from utils.checkpoint import save_checkpoint
+from utils.checkpoint import load_checkpoint
 from utils.config import RunConfig, load_config, generate_run_name
-from utils.logging import TrainLogger, DIM_NAMES_8D
 
 
 def parse_args():
@@ -35,7 +50,19 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--suffix", type=str, default=None)
     parser.add_argument("--kl_weight", type=float, default=None)
+    parser.add_argument("--val_every", type=int, default=None)
+    parser.add_argument("--patience", type=int, default=None)
+    parser.add_argument("--ckpt_every", type=int, default=None)
+    parser.add_argument("--plot_every", type=int, default=None)
+    parser.add_argument("--grad_clip", type=float, default=None)
+    # Pure CLI flags (not in config)
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from")
+    parser.add_argument("--no_callbacks", action="store_true",
+                        help="Disable callbacks (minimal epoch-based loop)")
+    parser.add_argument("--dry_run", action="store_true",
+                        help="Load config + data, print banner, exit before training")
     return parser.parse_args()
 
 
@@ -44,12 +71,25 @@ def main():
 
     # Build overrides dict from non-None CLI args
     overrides = {}
-    for field in ["rollout_k", "lr", "batch_size", "epochs", "suffix", "kl_weight"]:
+    for field in ["rollout_k", "lr", "batch_size", "epochs", "suffix", "kl_weight",
+                   "val_every", "patience", "ckpt_every", "plot_every", "grad_clip"]:
         val = getattr(args, field)
         if val is not None:
             overrides[field] = val
 
     config = load_config(args.config, overrides=overrides if overrides else None)
+
+    # Auto-detect dims from data if not explicitly set
+    if config.state_dim == 0 or config.action_dim == 0:
+        from data.loader import detect_dims
+        detected_state, detected_action = detect_dims(config.data_path)
+        if config.state_dim == 0:
+            config.state_dim = detected_state
+            print(f"Auto-detected state_dim={config.state_dim}")
+        if config.action_dim == 0:
+            config.action_dim = detected_action
+            print(f"Auto-detected action_dim={config.action_dim}")
+
     run_name = generate_run_name(config)
     run_dir = Path(config.run_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -78,6 +118,12 @@ def main():
     print(f"Train: {train_ds.n_episodes} episodes, {len(train_ds)} samples")
     print(f"Val: {val_ds.n_episodes} episodes, {len(val_ds)} samples")
 
+    # Also need single_step val loader for per-dim MSE (regardless of training mode)
+    val_ds_ss = EpisodeDataset(config.data_path, state_dim=config.state_dim,
+                               mode="single_step", split="val",
+                               val_fraction=config.val_fraction)
+    val_loader_ss = DataLoader(val_ds_ss, batch_size=config.batch_size)
+
     # Normalization stats from training data
     norm_stats = compute_norm_stats(train_ds.episode_dicts())
 
@@ -86,59 +132,152 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model: {config.arch} ({n_params:,} params)")
 
+    if args.dry_run:
+        print("Dry run — exiting before training.")
+        return
+
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
 
+    # Resume from checkpoint
+    start_epoch = 0
+    start_step = 0
+    if args.resume:
+        ckpt = load_checkpoint(args.resume)
+        model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", 0) + 1
+        start_step = ckpt.get("global_step", 0)
+        print(f"Resumed from {args.resume} (epoch={start_epoch}, step={start_step})")
+
     # Logging
-    writer = SummaryWriter(log_dir=str(run_dir / "tb"))
-    logger = TrainLogger(writer)
-
-    # Training
-    best_val_loss = float("inf")
-    for epoch in range(config.epochs):
-        # Compute schedule values
-        current_k = config.rollout_k
-        current_sampling_prob = 0.0
-        if config.curriculum:
-            current_k = curriculum_schedule(epoch, config.epochs,
-                                            k_min=1, k_max=config.rollout_k)
-        if config.training_mode == "scheduled_sampling":
-            current_sampling_prob = sampling_schedule(
-                epoch, config.epochs,
-                start=config.sampling_start, end=config.sampling_end)
-
-        train_metrics = train_epoch(
-            model, train_loader, optimizer, norm_stats,
-            training_mode=config.training_mode, rollout_k=current_k,
-            device=device, sampling_prob=current_sampling_prob,
+    tb_dir = str(run_dir / "tb")
+    writer = SummaryWriter(log_dir=tb_dir)
+    # Build callbacks
+    callbacks = []
+    if not args.no_callbacks:
+        callbacks.append(ValidationCallback(
+            val_loader=val_loader,
+            norm_stats=norm_stats,
+            training_mode=config.training_mode,
+            every_n_steps=config.val_every,
+            patience=config.patience,
+            checkpoint_dir=str(run_dir),
+            rollout_k=config.rollout_k,
             kl_weight=config.kl_weight,
-        )
-        val_metrics = validate(
-            model, val_loader, norm_stats,
-            training_mode=config.training_mode, rollout_k=current_k,
-            device=device, sampling_prob=current_sampling_prob,
-            kl_weight=config.kl_weight,
-        )
+        ))
+        callbacks.append(CheckpointCallback(
+            checkpoint_dir=str(run_dir),
+            every_n_steps=config.ckpt_every,
+        ))
+        callbacks.append(PerDimLossCallback(
+            val_loader=val_loader_ss,
+            norm_stats=norm_stats,
+            every_n_steps=config.val_every,
+        ))
+        callbacks.append(RolloutMetricsCallback(
+            dataset=val_ds,
+            norm_stats=norm_stats,
+            every_n_steps=config.rollout_every,
+            n_rollouts=config.rollout_n_rollouts,
+        ))
+        callbacks.append(GradNormCallback(every_n_steps=config.grad_norm_every))
+        callbacks.append(NaNDetectionCallback())
+        callbacks.append(ProgressCallback(
+            every_n_steps=config.val_every,
+            total_epochs=config.epochs,
+        ))
+        if data_mode == "sequence":
+            callbacks.append(PerTimestepLossCallback(
+                val_loader=val_loader,
+                norm_stats=norm_stats,
+                every_n_steps=config.val_every,
+            ))
+            callbacks.append(HiddenStateHealthCallback(
+                dataset=val_ds,
+                norm_stats=norm_stats,
+                every_n_steps=config.val_every,
+            ))
+            callbacks.append(WarmupRolloutCallback(
+                dataset=val_ds,
+                norm_stats=norm_stats,
+                every_n_steps=config.rollout_every,
+                n_rollouts=config.rollout_n_rollouts,
+            ))
+        callbacks.append(PlotExportCallback(
+            tb_dir=tb_dir,
+            plot_dir=str(run_dir / "plots"),
+            every_n_steps=config.plot_every,
+        ))
 
-        logger.log_scalar("train/loss", train_metrics["train_loss"], epoch)
-        logger.log_scalar("val/loss", val_metrics["val_loss"], epoch)
+    # Callback context
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=writer,
+        global_step=start_step, epoch=start_epoch,
+        run_dir=str(run_dir), device=device,
+    )
+    ctx.extras["config"] = config
+    ctx.extras["norm_stats"] = norm_stats
 
-        # Checkpoint
-        is_best = val_metrics["val_loss"] < best_val_loss
-        if is_best:
-            best_val_loss = val_metrics["val_loss"]
-            save_checkpoint(run_dir / "best.pt", model, optimizer, norm_stats,
-                            config, epoch, val_metrics)
+    # Graceful Ctrl-C: set flag so finally block saves checkpoint
+    stop_requested = False
 
-        if epoch % 10 == 0 or epoch == config.epochs - 1:
-            save_checkpoint(run_dir / f"epoch_{epoch:04d}.pt", model, optimizer,
-                            norm_stats, config, epoch, val_metrics)
-            print(f"  Epoch {epoch:3d}  train={train_metrics['train_loss']:.6f}  "
-                  f"val={val_metrics['val_loss']:.6f}  {'*' if is_best else ''}")
+    def _sigint_handler(signum, frame):
+        nonlocal stop_requested
+        if stop_requested:
+            sys.exit(1)
+        print("\nCtrl-C received — finishing current step and saving checkpoint...")
+        stop_requested = True
 
-    writer.close()
-    print(f"Done. Best val loss: {best_val_loss:.6f}")
-    print(f"Checkpoints in: {run_dir}")
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    # Dispatch on_train_start
+    for cb in callbacks:
+        cb.on_train_start(ctx)
+
+    # Training loop
+    try:
+        for epoch in range(start_epoch, config.epochs):
+            # Compute schedule values
+            current_k = config.rollout_k
+            current_sampling_prob = 0.0
+            if config.curriculum:
+                current_k = curriculum_schedule(epoch, config.epochs,
+                                                k_min=1, k_max=config.rollout_k)
+            if config.training_mode == "scheduled_sampling":
+                current_sampling_prob = sampling_schedule(
+                    epoch, config.epochs,
+                    start=config.sampling_start, end=config.sampling_end)
+
+            ctx.epoch = epoch
+            train_metrics = train_epoch(
+                model, train_loader, optimizer, norm_stats,
+                training_mode=config.training_mode, rollout_k=current_k,
+                device=device, max_grad_norm=config.grad_clip,
+                sampling_prob=current_sampling_prob, kl_weight=config.kl_weight,
+                ctx=ctx, callbacks=callbacks,
+            )
+
+            # Dispatch on_epoch_end callbacks
+            stop_requested = stop_requested or train_metrics.get("stop_requested", False)
+            if not stop_requested:
+                for cb in callbacks:
+                    if cb.on_epoch_end(ctx) is False:
+                        stop_requested = True
+                        break
+
+            if stop_requested:
+                break
+
+    finally:
+        # Always dispatch on_train_end
+        for cb in callbacks:
+            cb.on_train_end(ctx)
+        writer.close()
+
+    best_val = ctx.extras.get("val_loss", float("nan"))
+    print(f"Done. Final val loss: {best_val:.6f}")
+    print(f"Output: {run_dir}")
 
 
 if __name__ == "__main__":

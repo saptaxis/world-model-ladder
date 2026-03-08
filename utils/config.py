@@ -25,6 +25,16 @@ class RunConfig:
     curriculum: bool = False
     kl_weight: float = 1.0              # KL weight for ELBO loss
 
+    # Callback frequencies
+    val_every: int = 500
+    patience: int = 20
+    ckpt_every: int = 2000
+    plot_every: int = 5000
+    grad_norm_every: int = 50
+    rollout_every: int = 2000
+    rollout_n_rollouts: int = 10
+    grad_clip: float = 1.0
+
     # Data
     data_mix: str = "policy"            # "policy" | "policy_primitives"
     data_path: str = ""                 # required — validated in __post_init__

@@ -10,7 +10,8 @@ from training.losses import single_step_loss, multi_step_loss, scheduled_samplin
 def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
                 training_mode: str = "single_step", rollout_k: int = 1,
                 device: str = "cpu", max_grad_norm: float = 1.0,
-                sampling_prob: float = 0.0, kl_weight: float = 1.0) -> dict:
+                sampling_prob: float = 0.0, kl_weight: float = 1.0,
+                ctx=None, callbacks=None) -> dict:
     """Run one training epoch.
 
     Args:
@@ -22,13 +23,18 @@ def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
         rollout_k: horizon for multi-step loss
         device: torch device
         max_grad_norm: gradient clipping threshold
+        sampling_prob: probability of using model predictions (scheduled sampling)
+        kl_weight: weight for KL divergence term (ELBO)
+        ctx: optional CallbackContext (updated in-place with global_step)
+        callbacks: optional list of TrainCallback (dispatched per step)
 
     Returns:
-        dict with "train_loss" (mean over batches)
+        dict with "train_loss" (mean over batches), "stop_requested" (bool)
     """
     model.train()
     total_loss = 0.0
     n_batches = 0
+    stop_requested = False
 
     for batch in train_loader:
         batch = tuple(t.to(device) for t in batch)
@@ -52,12 +58,30 @@ def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+
+        # Dispatch on_step callbacks AFTER backward+clip, BEFORE optimizer.step()
+        if ctx is not None and callbacks:
+            ctx.global_step += 1
+            ctx.extras["train_loss_step"] = loss.item()
+            if ctx.writer:
+                ctx.writer.add_scalar("train/loss", loss.item(), ctx.global_step)
+            for cb in callbacks:
+                if cb.on_step(ctx) is False:
+                    stop_requested = True
+                    break
+
         optimizer.step()
 
         total_loss += loss.item()
         n_batches += 1
 
-    return {"train_loss": total_loss / max(n_batches, 1)}
+        if stop_requested:
+            break
+
+    return {
+        "train_loss": total_loss / max(n_batches, 1),
+        "stop_requested": stop_requested,
+    }
 
 
 @torch.no_grad()
