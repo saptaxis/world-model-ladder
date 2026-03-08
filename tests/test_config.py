@@ -1,7 +1,7 @@
 import pytest
 import yaml
 from pathlib import Path
-from utils.config import RunConfig, load_config, generate_run_name
+from utils.config import RunConfig, load_config, generate_run_name, validate_config
 
 
 def test_run_config_defaults():
@@ -58,3 +58,16 @@ def test_load_config_with_overrides(tmp_path):
     assert loaded.rollout_k == 20
     assert loaded.suffix == "test"
     assert loaded.arch == "mlp"  # unchanged
+
+
+def test_validate_config_elbo_requires_rssm():
+    """ELBO training mode only works with models that have kl_loss()."""
+    cfg = RunConfig(arch="mlp", data_path="/tmp/data",
+                    training_mode="elbo", rollout_k=5)
+    with pytest.raises(ValueError, match="kl_loss"):
+        validate_config(cfg)
+
+def test_validate_config_elbo_with_rssm_ok():
+    cfg = RunConfig(arch="rssm", data_path="/tmp/data",
+                    training_mode="elbo", rollout_k=5)
+    validate_config(cfg)  # should not raise

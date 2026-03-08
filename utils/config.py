@@ -84,6 +84,19 @@ def generate_run_name(config: RunConfig) -> str:
     return name
 
 
+# Architectures known to implement kl_loss()
+_KL_ARCHS = {"rssm"}
+
+
+def validate_config(config: RunConfig) -> None:
+    """Validate config consistency. Raises ValueError on problems."""
+    if config.training_mode == "elbo" and config.arch not in _KL_ARCHS:
+        raise ValueError(
+            f"training_mode='elbo' requires a model with kl_loss() "
+            f"(arch must be one of {_KL_ARCHS}, got '{config.arch}')"
+        )
+
+
 def load_config(path: str, overrides: dict | None = None) -> RunConfig:
     """Load config from YAML with optional field overrides."""
     cfg = RunConfig.load(path)

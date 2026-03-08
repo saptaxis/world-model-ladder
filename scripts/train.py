@@ -37,7 +37,7 @@ from training.callbacks import (
 from training.loop import train_epoch
 from training.scheduling import curriculum_schedule, sampling_schedule
 from utils.checkpoint import load_checkpoint, get_git_hash
-from utils.config import RunConfig, load_config, generate_run_name
+from utils.config import RunConfig, load_config, generate_run_name, validate_config
 
 
 def parse_args():
@@ -89,6 +89,8 @@ def main():
         if config.action_dim == 0:
             config.action_dim = detected_action
             print(f"Auto-detected action_dim={config.action_dim}")
+
+    validate_config(config)
 
     run_name = generate_run_name(config)
     run_dir = Path(config.run_dir) / run_name
