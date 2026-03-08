@@ -1,5 +1,5 @@
 import torch
-from data.loader import EpisodeDataset
+from data.loader import EpisodeDataset, detect_dims
 
 
 def test_load_episodes(episode_dir):
@@ -53,3 +53,15 @@ def test_dataloader_integration(episode_dir):
     assert s.shape == (16, 8)
     assert a.shape == (16, 2)
     assert delta.shape == (16, 8)
+
+
+def test_detect_dims(episode_dir):
+    state_dim, action_dim = detect_dims(episode_dir)
+    assert state_dim == 8
+    assert action_dim == 2
+
+
+def test_detect_dims_missing_dir():
+    import pytest
+    with pytest.raises(FileNotFoundError):
+        detect_dims("/nonexistent/path")

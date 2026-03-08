@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from utils.config import RunConfig
+from models.copy import CopyStateModel
 from models.linear import LinearModel
 from models.mlp import MLPModel
 from models.gru import GRUModel
@@ -10,7 +11,9 @@ from models.rssm import RSSMModel
 
 def build_model(config: RunConfig):
     """Construct a WorldModel from config."""
-    if config.arch == "linear":
+    if config.arch == "copy":
+        return CopyStateModel(state_dim=config.state_dim)
+    elif config.arch == "linear":
         return LinearModel(
             state_dim=config.state_dim,
             action_dim=config.action_dim,
@@ -47,5 +50,5 @@ def build_model(config: RunConfig):
     else:
         raise ValueError(
             f"Unknown architecture: {config.arch}. "
-            f"Available: linear, mlp, gru, rssm"
+            f"Available: copy, linear, mlp, gru, rssm"
         )

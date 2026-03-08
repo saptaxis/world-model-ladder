@@ -228,3 +228,35 @@ def test_build_unknown_arch():
     cfg = RunConfig(arch="transformer", data_path="/tmp")
     with pytest.raises(ValueError, match="Unknown architecture"):
         build_model(cfg)
+
+
+from models.copy import CopyStateModel
+
+
+def test_copy_state_output_shape():
+    model = CopyStateModel(state_dim=8)
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    delta, ms = model.step(obs, action)
+    assert delta.shape == (4, 8)
+    assert ms is None
+
+
+def test_copy_state_predicts_zero():
+    model = CopyStateModel(state_dim=8)
+    obs = torch.randn(4, 8)
+    action = torch.randn(4, 2)
+    delta, _ = model.step(obs, action)
+    assert torch.allclose(delta, torch.zeros_like(delta))
+
+
+def test_copy_state_is_world_model():
+    from models.base import WorldModel
+    model = CopyStateModel(state_dim=8)
+    assert isinstance(model, WorldModel)
+
+
+def test_build_copy():
+    cfg = RunConfig(arch="copy", data_path="/tmp", state_dim=8, action_dim=2)
+    model = build_model(cfg)
+    assert isinstance(model, CopyStateModel)

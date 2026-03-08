@@ -122,3 +122,22 @@ class EpisodeDataset(Dataset):
             }
             for i in range(self.n_episodes)
         ]
+
+
+def detect_dims(data_path: str | Path) -> tuple[int, int]:
+    """Auto-detect state_dim and action_dim from the first .npz file.
+
+    Args:
+        data_path: directory containing .npz episode files
+
+    Returns:
+        (state_dim, action_dim) tuple
+    """
+    npz_paths = sorted(Path(data_path).glob("**/*.npz"))
+    if not npz_paths:
+        raise FileNotFoundError(f"No .npz files in {data_path}")
+
+    d = np.load(npz_paths[0], allow_pickle=False)
+    state_dim = d["states"].shape[1]
+    action_dim = d["actions"].shape[1]
+    return state_dim, action_dim
