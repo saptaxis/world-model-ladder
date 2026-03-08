@@ -1,5 +1,10 @@
 """Tests for plotting utilities."""
-from utils.plotting import plot_horizon_curve, plot_per_dim_bars
+from pathlib import Path
+
+import torch
+from torch.utils.tensorboard import SummaryWriter
+
+from utils.plotting import plot_horizon_curve, plot_per_dim_bars, export_plots
 
 
 def test_plot_horizon_curve(tmp_path):
@@ -23,3 +28,41 @@ def test_plot_horizon_curve_log_scale(tmp_path):
     out = tmp_path / "horizon_log.png"
     plot_horizon_curve(horizon_data, str(out), log_scale=True)
     assert out.exists()
+
+
+def test_export_plots_creates_pngs(tmp_path):
+    tb_dir = tmp_path / "tb"
+    writer = SummaryWriter(log_dir=str(tb_dir))
+    for i in range(10):
+        writer.add_scalar("train/loss", 1.0 / (i + 1), i)
+        writer.add_scalar("val/loss", 1.5 / (i + 1), i)
+    writer.close()
+
+    plot_dir = tmp_path / "plots"
+    export_plots(str(tb_dir), str(plot_dir))
+
+    assert plot_dir.exists()
+    png_files = list(plot_dir.glob("*.png"))
+    assert len(png_files) >= 2
+
+
+def test_export_plots_skips_short_series(tmp_path):
+    tb_dir = tmp_path / "tb"
+    writer = SummaryWriter(log_dir=str(tb_dir))
+    writer.add_scalar("single/point", 1.0, 0)
+    writer.add_scalar("multi/points", 1.0, 0)
+    writer.add_scalar("multi/points", 0.5, 1)
+    writer.close()
+
+    plot_dir = tmp_path / "plots"
+    export_plots(str(tb_dir), str(plot_dir))
+
+    png_files = list(plot_dir.glob("*.png"))
+    assert len(png_files) == 1
+
+
+def test_export_plots_empty_dir(tmp_path):
+    tb_dir = tmp_path / "tb"
+    tb_dir.mkdir()
+    plot_dir = tmp_path / "plots"
+    export_plots(str(tb_dir), str(plot_dir))

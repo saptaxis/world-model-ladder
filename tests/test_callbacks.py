@@ -13,6 +13,8 @@ from utils.config import RunConfig
 from training.callbacks import (
     CallbackContext, TrainCallback, ValidationCallback, CheckpointCallback,
     PerDimLossCallback, RolloutMetricsCallback, GradNormCallback,
+    PerTimestepLossCallback, HiddenStateHealthCallback, WarmupRolloutCallback,
+    NaNDetectionCallback, ProgressCallback,
 )
 
 
@@ -349,3 +351,214 @@ def test_grad_norm_callback_no_gradients(tmp_path):
     result = cb.on_step(ctx)
     assert result is True
     assert "grad_norms" in ctx.extras
+
+
+# ---------------------------------------------------------------------------
+# Task 8: PerTimestepLossCallback
+# ---------------------------------------------------------------------------
+
+def test_per_timestep_loss_callback(tmp_path, episode_dir):
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters())
+    writer = SummaryWriter(log_dir=str(tmp_path / "tb"))
+
+    val_ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    val_loader = DataLoader(val_ds, batch_size=8)
+    norm_stats = compute_norm_stats(val_ds.episode_dicts())
+
+    cb = PerTimestepLossCallback(
+        val_loader=val_loader, norm_stats=norm_stats,
+        every_n_steps=1, positions=[0, 4, 9],
+    )
+
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=writer,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu",
+    )
+    result = cb.on_step(ctx)
+    assert result is True
+    assert "per_timestep_mse" in ctx.extras
+    assert 0 in ctx.extras["per_timestep_mse"]
+    assert 4 in ctx.extras["per_timestep_mse"]
+    writer.close()
+
+
+def test_per_timestep_loss_callback_skip_step_0(tmp_path, episode_dir):
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters())
+
+    val_ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    val_loader = DataLoader(val_ds, batch_size=8)
+    norm_stats = compute_norm_stats(val_ds.episode_dicts())
+
+    cb = PerTimestepLossCallback(val_loader=val_loader, norm_stats=norm_stats, every_n_steps=1)
+
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=None,
+        global_step=0, epoch=0, run_dir=str(tmp_path), device="cpu",
+    )
+    cb.on_step(ctx)
+    assert "per_timestep_mse" not in ctx.extras
+
+
+# ---------------------------------------------------------------------------
+# Task 9: HiddenStateHealthCallback
+# ---------------------------------------------------------------------------
+
+def test_hidden_state_health_callback_gru(tmp_path, episode_dir):
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters())
+    writer = SummaryWriter(log_dir=str(tmp_path / "tb"))
+
+    val_ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    norm_stats = compute_norm_stats(val_ds.episode_dicts())
+
+    cb = HiddenStateHealthCallback(dataset=val_ds, norm_stats=norm_stats, every_n_steps=1, n_episodes=3)
+
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=writer,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu",
+    )
+    result = cb.on_step(ctx)
+    assert result is True
+    assert "hidden_health" in ctx.extras
+    assert "magnitude" in ctx.extras["hidden_health"]
+    assert "saturation" in ctx.extras["hidden_health"]
+    assert "effective_dim" in ctx.extras["hidden_health"]
+    writer.close()
+
+
+def test_hidden_state_health_skips_stateless(tmp_path, episode_dir):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[16])
+    optimizer = torch.optim.Adam(model.parameters())
+
+    val_ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    norm_stats = compute_norm_stats(val_ds.episode_dicts())
+
+    cb = HiddenStateHealthCallback(dataset=val_ds, norm_stats=norm_stats, every_n_steps=1)
+
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=None,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu",
+    )
+    result = cb.on_step(ctx)
+    assert result is True
+    assert "hidden_health" not in ctx.extras
+
+
+# ---------------------------------------------------------------------------
+# Task 10: WarmupRolloutCallback
+# ---------------------------------------------------------------------------
+
+def test_warmup_rollout_callback_gru(tmp_path, episode_dir):
+    model = GRUModel(state_dim=8, action_dim=2, hidden_dim=16)
+    optimizer = torch.optim.Adam(model.parameters())
+    writer = SummaryWriter(log_dir=str(tmp_path / "tb"))
+
+    val_ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    norm_stats = compute_norm_stats(val_ds.episode_dicts())
+
+    cb = WarmupRolloutCallback(
+        dataset=val_ds, norm_stats=norm_stats,
+        warmup_steps=5, horizons=[1, 5],
+        every_n_steps=1, n_rollouts=3,
+    )
+
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=writer,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu",
+    )
+    result = cb.on_step(ctx)
+    assert result is True
+    assert "warmup_horizon_errors" in ctx.extras
+    writer.close()
+
+
+def test_warmup_rollout_skips_stateless(tmp_path, episode_dir):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[16])
+    optimizer = torch.optim.Adam(model.parameters())
+
+    val_ds = EpisodeDataset(episode_dir, state_dim=8, mode="sequence", seq_len=10)
+    norm_stats = compute_norm_stats(val_ds.episode_dicts())
+
+    cb = WarmupRolloutCallback(
+        dataset=val_ds, norm_stats=norm_stats,
+        warmup_steps=5, horizons=[1, 5],
+        every_n_steps=1, n_rollouts=2,
+    )
+
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=None,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu",
+    )
+    result = cb.on_step(ctx)
+    assert result is True
+    assert "warmup_horizon_errors" not in ctx.extras
+
+
+# ---------------------------------------------------------------------------
+# Task 11: NaNDetectionCallback
+# ---------------------------------------------------------------------------
+
+def test_nan_detection_callback_passes_on_normal_loss(tmp_path):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[16])
+    optimizer = torch.optim.Adam(model.parameters())
+    cb = NaNDetectionCallback()
+    ctx = CallbackContext(model=model, optimizer=optimizer, writer=None,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu")
+    ctx.extras["train_loss_step"] = 0.5
+    result = cb.on_step(ctx)
+    assert result is True
+
+
+def test_nan_detection_callback_stops_on_nan(tmp_path):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[16])
+    optimizer = torch.optim.Adam(model.parameters())
+    cb = NaNDetectionCallback()
+    ctx = CallbackContext(model=model, optimizer=optimizer, writer=None,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu")
+    ctx.extras["train_loss_step"] = float("nan")
+    result = cb.on_step(ctx)
+    assert result is False
+
+
+def test_nan_detection_callback_stops_on_inf(tmp_path):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[16])
+    optimizer = torch.optim.Adam(model.parameters())
+    cb = NaNDetectionCallback()
+    ctx = CallbackContext(model=model, optimizer=optimizer, writer=None,
+        global_step=1, epoch=0, run_dir=str(tmp_path), device="cpu")
+    ctx.extras["train_loss_step"] = float("inf")
+    result = cb.on_step(ctx)
+    assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Task 12: ProgressCallback
+# ---------------------------------------------------------------------------
+
+def test_progress_callback_prints(tmp_path, capsys):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[16])
+    optimizer = torch.optim.Adam(model.parameters())
+    cb = ProgressCallback(every_n_steps=5, total_epochs=10)
+    ctx = CallbackContext(model=model, optimizer=optimizer, writer=None,
+        global_step=5, epoch=0, run_dir=str(tmp_path), device="cpu")
+    ctx.extras["train_loss_step"] = 0.123
+    ctx.extras["val_loss"] = 0.456
+    cb.on_train_start(ctx)  # initialize start_time
+    cb.on_step(ctx)
+    captured = capsys.readouterr()
+    assert "step=5" in captured.out
+    assert "0.123" in captured.out
+
+
+def test_progress_callback_skips_non_interval(tmp_path, capsys):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[16])
+    optimizer = torch.optim.Adam(model.parameters())
+    cb = ProgressCallback(every_n_steps=10, total_epochs=10)
+    ctx = CallbackContext(model=model, optimizer=optimizer, writer=None,
+        global_step=3, epoch=0, run_dir=str(tmp_path), device="cpu")
+    ctx.extras["train_loss_step"] = 0.5
+    cb.on_step(ctx)
+    captured = capsys.readouterr()
+    assert captured.out == ""

@@ -6,18 +6,22 @@ training start/end.
 """
 from __future__ import annotations
 
+import math
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Optimizer
 
-from data.normalization import NormStats
+from data.normalization import NormStats, normalize, denormalize
 from evaluation.metrics.core import per_dim_mse, horizon_error_curve
 from training.loop import validate
 from utils.checkpoint import save_checkpoint
+from utils.plotting import export_plots
 
 
 @dataclass
@@ -233,4 +237,315 @@ class GradNormCallback(TrainCallback):
         if ctx.writer:
             for module_name, norm in grad_norms.items():
                 ctx.writer.add_scalar(f"grad/{module_name}", norm, ctx.global_step)
+        return True
+
+
+class PlotExportCallback(TrainCallback):
+    """Periodically export TensorBoard scalars as PNG plots."""
+
+    def __init__(self, tb_dir: str, plot_dir: str, every_n_steps: int = 5000):
+        self.tb_dir = tb_dir
+        self.plot_dir = plot_dir
+        self.every_n_steps = every_n_steps
+
+    def on_train_start(self, ctx):
+        Path(self.plot_dir).mkdir(parents=True, exist_ok=True)
+
+    def on_step(self, ctx):
+        if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
+            return True
+        try:
+            if ctx.writer:
+                ctx.writer.flush()
+            export_plots(self.tb_dir, self.plot_dir)
+        except Exception:
+            pass
+        return True
+
+    def on_train_end(self, ctx):
+        try:
+            if ctx.writer:
+                ctx.writer.flush()
+            export_plots(self.tb_dir, self.plot_dir)
+        except Exception:
+            pass
+
+
+class PerTimestepLossCallback(TrainCallback):
+    """Log per-timestep MSE within multi-step rollouts."""
+
+    def __init__(self, val_loader, norm_stats: NormStats,
+                 every_n_steps: int = 500,
+                 positions: list[int] | None = None):
+        self.val_loader = val_loader
+        self.norm_stats = norm_stats
+        self.every_n_steps = every_n_steps
+        self.positions = positions or [0, 4, 9, 24, 49]
+
+    def on_step(self, ctx):
+        if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
+            return True
+
+        ctx.model.eval()
+        all_sq_errors = []
+
+        with torch.no_grad():
+            for batch in self.val_loader:
+                batch = tuple(t.to(ctx.device) for t in batch)
+                state_seq, action_seq = batch
+                ns = self.norm_stats.to(ctx.device)
+
+                s = state_seq[:, 0]
+                model_state = None
+                step_errors = []
+
+                T = action_seq.shape[1]
+                for t in range(T):
+                    s_n = normalize(s, ns.state_mean, ns.state_std)
+                    delta_n, model_state = ctx.model.step(s_n, action_seq[:, t], model_state)
+                    delta_raw = denormalize(delta_n, ns.delta_mean, ns.delta_std)
+                    s = s + delta_raw
+
+                    true_delta = state_seq[:, t + 1] - state_seq[:, t]
+                    sq_err = (delta_raw - true_delta).pow(2).mean(dim=-1)
+                    step_errors.append(sq_err.mean().item())
+
+                all_sq_errors.append(step_errors)
+
+        ctx.model.train()
+
+        if not all_sq_errors:
+            return True
+
+        avg_errors = np.mean(all_sq_errors, axis=0)
+        max_t = len(avg_errors)
+
+        per_ts = {}
+        for p in self.positions:
+            if p < max_t:
+                per_ts[p] = float(avg_errors[p])
+                if ctx.writer:
+                    ctx.writer.add_scalar(f"seq_loss/t{p + 1:02d}", avg_errors[p], ctx.global_step)
+
+        ctx.extras["per_timestep_mse"] = per_ts
+        return True
+
+
+class HiddenStateHealthCallback(TrainCallback):
+    """Monitor GRU/RSSM hidden state health during training."""
+
+    def __init__(self, dataset, norm_stats: NormStats,
+                 every_n_steps: int = 500, n_episodes: int = 16):
+        self.dataset = dataset
+        self.norm_stats = norm_stats
+        self.every_n_steps = every_n_steps
+        self.n_episodes = n_episodes
+
+    def on_step(self, ctx):
+        if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
+            return True
+
+        model = ctx.model
+        test_state = model.initial_state(1, device=ctx.device)
+        if test_state is None:
+            return True
+
+        model.eval()
+        ns = self.norm_stats.to(ctx.device)
+        all_hidden = []
+
+        with torch.no_grad():
+            n_done = 0
+            for ep_idx in range(self.dataset.n_episodes):
+                if n_done >= self.n_episodes:
+                    break
+                states_np = self.dataset.states[ep_idx]
+                actions_np = self.dataset.actions[ep_idx]
+                T = len(actions_np)
+                if T < 5:
+                    continue
+
+                states = torch.from_numpy(states_np).to(ctx.device)
+                actions = torch.from_numpy(actions_np).to(ctx.device)
+
+                model_state = model.initial_state(1, device=ctx.device)
+                for t in range(T):
+                    s_n = normalize(states[t].unsqueeze(0), ns.state_mean, ns.state_std)
+                    _, model_state = model.step(s_n, actions[t].unsqueeze(0), model_state)
+
+                    if isinstance(model_state, torch.Tensor):
+                        h = model_state[-1, 0]
+                    elif hasattr(model_state, 'deter'):
+                        h = model_state.deter[0]
+                    else:
+                        break
+                    all_hidden.append(h.cpu())
+
+                n_done += 1
+
+        model.train()
+
+        if not all_hidden:
+            return True
+
+        hidden_matrix = torch.stack(all_hidden).numpy()
+
+        norms = np.linalg.norm(hidden_matrix, axis=1)
+        magnitude = float(np.mean(norms))
+        saturation = float(np.mean(np.abs(hidden_matrix) > 0.95))
+
+        centered = hidden_matrix - hidden_matrix.mean(axis=0)
+        if centered.shape[0] > 1 and centered.shape[1] > 1:
+            try:
+                cov = np.cov(centered.T)
+                eigvals = np.linalg.eigvalsh(cov)
+                eigvals = np.maximum(eigvals[::-1], 0)
+                total_var = eigvals.sum()
+                if total_var > 0:
+                    cumvar = np.cumsum(eigvals) / total_var
+                    effective_dim = int(np.searchsorted(cumvar, 0.95) + 1)
+                else:
+                    effective_dim = 0
+            except np.linalg.LinAlgError:
+                effective_dim = 0
+        else:
+            effective_dim = 0
+
+        health = {"magnitude": magnitude, "saturation": saturation, "effective_dim": effective_dim}
+        ctx.extras["hidden_health"] = health
+
+        if ctx.writer:
+            ctx.writer.add_scalar("hidden/magnitude", magnitude, ctx.global_step)
+            ctx.writer.add_scalar("hidden/saturation", saturation, ctx.global_step)
+            ctx.writer.add_scalar("hidden/effective_dim", effective_dim, ctx.global_step)
+
+        return True
+
+
+class WarmupRolloutCallback(TrainCallback):
+    """Rollout evaluation with hidden state warmup for recurrent models."""
+
+    def __init__(self, dataset, norm_stats: NormStats,
+                 warmup_steps: int = 10,
+                 horizons: list[int] | None = None,
+                 every_n_steps: int = 2000, n_rollouts: int = 10):
+        self.dataset = dataset
+        self.norm_stats = norm_stats
+        self.warmup_steps = warmup_steps
+        self.horizons = horizons or [1, 5, 10, 20]
+        self.every_n_steps = every_n_steps
+        self.n_rollouts = n_rollouts
+
+    def on_step(self, ctx):
+        if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
+            return True
+
+        model = ctx.model
+        test_state = model.initial_state(1, device=ctx.device)
+        if test_state is None:
+            return True
+
+        model.eval()
+        ns = self.norm_stats.to(ctx.device)
+        max_h = max(self.horizons)
+        min_ep_len = self.warmup_steps + max_h
+
+        step_errors = {h: [] for h in self.horizons}
+        n_done = 0
+
+        with torch.no_grad():
+            for ep_idx in range(self.dataset.n_episodes):
+                if n_done >= self.n_rollouts:
+                    break
+                states_np = self.dataset.states[ep_idx]
+                actions_np = self.dataset.actions[ep_idx]
+                T = len(actions_np)
+                if T < min_ep_len:
+                    continue
+
+                states = torch.from_numpy(states_np).to(ctx.device)
+                actions = torch.from_numpy(actions_np).to(ctx.device)
+
+                model_state = model.initial_state(1, device=ctx.device)
+                for t in range(self.warmup_steps):
+                    s_n = normalize(states[t].unsqueeze(0), ns.state_mean, ns.state_std)
+                    _, model_state = model.step(s_n, actions[t].unsqueeze(0), model_state)
+
+                s = states[self.warmup_steps].unsqueeze(0)
+                for t in range(max_h):
+                    act_idx = self.warmup_steps + t
+                    if act_idx >= T:
+                        break
+                    s_n = normalize(s, ns.state_mean, ns.state_std)
+                    delta_n, model_state = model.step(s_n, actions[act_idx].unsqueeze(0), model_state)
+                    delta_raw = denormalize(delta_n, ns.delta_mean, ns.delta_std)
+                    s = s + delta_raw
+
+                    h = t + 1
+                    if h in step_errors:
+                        true_state = states[self.warmup_steps + h]
+                        sq_err = (s[0] - true_state).pow(2).mean()
+                        step_errors[h].append(sq_err.item())
+
+                n_done += 1
+
+        model.train()
+
+        warmup_errors = {}
+        for h in self.horizons:
+            if step_errors[h]:
+                mean_err = float(np.mean(step_errors[h]))
+                warmup_errors[h] = mean_err
+                if ctx.writer:
+                    ctx.writer.add_scalar(f"warmup_rollout/mse_h{h:02d}", mean_err, ctx.global_step)
+
+        if warmup_errors:
+            ctx.extras["warmup_horizon_errors"] = warmup_errors
+
+        return True
+
+
+class NaNDetectionCallback(TrainCallback):
+    """Halts training when NaN or Inf loss is detected."""
+
+    def on_step(self, ctx):
+        loss = ctx.extras.get("train_loss_step")
+        if loss is not None and (math.isnan(loss) or math.isinf(loss)):
+            print(f"NaN/Inf detected at step {ctx.global_step} (loss={loss}). Halting training.")
+            return False
+        return True
+
+
+class ProgressCallback(TrainCallback):
+    """Prints training progress at regular intervals."""
+
+    def __init__(self, every_n_steps: int = 100, total_epochs: int = 0):
+        self.every_n_steps = every_n_steps
+        self.total_epochs = total_epochs
+        self.start_time = None
+
+    def on_train_start(self, ctx):
+        self.start_time = time.time()
+
+    def on_step(self, ctx):
+        if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
+            return True
+
+        train_loss = ctx.extras.get("train_loss_step", float("nan"))
+        val_loss = ctx.extras.get("val_loss", float("nan"))
+
+        elapsed = time.time() - self.start_time if self.start_time else 0
+        steps_per_sec = ctx.global_step / elapsed if elapsed > 0 else 0
+
+        epoch_str = f"epoch={ctx.epoch}"
+        if self.total_epochs > 0:
+            epoch_str = f"epoch={ctx.epoch}/{self.total_epochs}"
+
+        print(f"  [{epoch_str}  step={ctx.global_step}]  "
+              f"train={train_loss:.6f}  val={val_loss:.6f}  "
+              f"({steps_per_sec:.1f} steps/s)")
+
+        if ctx.writer:
+            ctx.writer.add_scalar("perf/steps_per_sec", steps_per_sec, ctx.global_step)
+
         return True
