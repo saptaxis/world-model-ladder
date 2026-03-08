@@ -95,6 +95,59 @@ def horizon_error_curve(model, dataset, norm_stats: NormStats,
     return result
 
 
+@torch.no_grad()
+def cumulative_trajectory_mse(model, dataset, norm_stats: NormStats,
+                               horizons: list[int] = (1, 5, 10, 20, 50),
+                               n_rollouts: int = 50, device: str = "cpu") -> dict:
+    """Average MSE across all steps 1..h for each horizon (Eval B').
+
+    Unlike horizon_error_curve which measures error at step h only,
+    this measures mean error across the entire trajectory up to h.
+    Captures trajectory-level divergence that endpoint-only measurement misses.
+
+    Returns: dict mapping horizon -> [state_dim] tensor of per-dim mean MSE.
+    """
+    model.eval()
+    max_h = max(horizons)
+    ns = norm_stats.to(device)
+
+    step_errors = {h: [] for h in horizons}
+    n_done = 0
+
+    for ep_idx in range(dataset.n_episodes):
+        if n_done >= n_rollouts:
+            break
+        states = torch.from_numpy(dataset.states[ep_idx]).to(device)
+        actions = torch.from_numpy(dataset.actions[ep_idx]).to(device)
+        T = len(actions)
+        if T < max_h:
+            continue
+
+        s0 = states[0].unsqueeze(0)
+        acts = actions[:max_h].unsqueeze(0)
+        pred_states = _rollout_raw_space(model, s0, acts, ns)
+
+        for h in horizons:
+            if h > T:
+                continue
+            errs = []
+            for t in range(1, h + 1):
+                sq_err = (pred_states[0, t] - states[t]).pow(2)
+                errs.append(sq_err)
+            cumul_mse = torch.stack(errs).mean(dim=0)
+            step_errors[h].append(cumul_mse.cpu())
+
+        n_done += 1
+
+    result = {}
+    for h in horizons:
+        if step_errors[h]:
+            result[h] = torch.stack(step_errors[h]).mean(dim=0)
+        else:
+            result[h] = torch.zeros(norm_stats.state_mean.shape[0])
+    return result
+
+
 def divergence_exponent(horizon_errors: dict) -> float:
     """Fit lambda in error(h) ~ e^(lambda * h) (Eval B).
 

@@ -8,6 +8,7 @@ from models.mlp import MLPModel
 from evaluation.metrics.core import (
     per_dim_mse,
     horizon_error_curve,
+    cumulative_trajectory_mse,
     divergence_exponent,
     horizon_to_failure,
 )
@@ -60,3 +61,35 @@ def test_horizon_to_failure_never_fails():
     errors = {1: 0.01, 5: 0.02, 10: 0.03}
     htf = horizon_to_failure(errors, threshold=1.0)
     assert htf == 10  # never exceeded
+
+
+def test_cumulative_trajectory_mse_shapes(episode_dir):
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[32])
+    ds = EpisodeDataset(episode_dir, state_dim=8)
+    ns = _make_norm_stats()
+    horizons = [1, 5, 10]
+    result = cumulative_trajectory_mse(model, ds, ns, horizons=horizons)
+    assert set(result.keys()) == set(horizons)
+    for h in horizons:
+        assert result[h].shape == (8,)
+        assert (result[h] >= 0).all()
+
+
+def test_cumulative_at_h1_equals_endpoint(episode_dir):
+    """At h=1, cumulative (average of steps 1..1) equals endpoint (step 1)."""
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[32])
+    ds = EpisodeDataset(episode_dir, state_dim=8)
+    ns = _make_norm_stats()
+    endpoint = horizon_error_curve(model, ds, ns, horizons=[1], n_rollouts=10)
+    cumul = cumulative_trajectory_mse(model, ds, ns, horizons=[1], n_rollouts=10)
+    torch.testing.assert_close(cumul[1], endpoint[1], atol=1e-6, rtol=1e-5)
+
+
+def test_cumulative_differs_from_endpoint(episode_dir):
+    """At h>1, cumulative should generally differ from endpoint."""
+    model = MLPModel(state_dim=8, action_dim=2, hidden_dims=[32])
+    ds = EpisodeDataset(episode_dir, state_dim=8)
+    ns = _make_norm_stats()
+    endpoint = horizon_error_curve(model, ds, ns, horizons=[10], n_rollouts=10)
+    cumul = cumulative_trajectory_mse(model, ds, ns, horizons=[10], n_rollouts=10)
+    assert cumul[10].shape == endpoint[10].shape
