@@ -11,17 +11,21 @@ from utils.config import RunConfig
 
 
 def save_checkpoint(path, model, optimizer, norm_stats: NormStats,
-                    config: RunConfig, epoch: int, metrics: dict | None = None):
+                    config: RunConfig, epoch: int, metrics: dict | None = None,
+                    global_step: int | None = None):
     """Save everything needed to resume training or run evaluation."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({
+    ckpt = {
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "norm_stats": norm_stats.to_dict(),
         "config": dataclasses.asdict(config),
         "epoch": epoch,
         "metrics": metrics or {},
-    }, path)
+    }
+    if global_step is not None:
+        ckpt["global_step"] = global_step
+    torch.save(ckpt, path)
 
 
 def load_checkpoint(path, device="cpu") -> dict:

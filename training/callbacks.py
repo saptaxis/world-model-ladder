@@ -109,6 +109,7 @@ class ValidationCallback(TrainCallback):
                     ctx.model, ctx.optimizer, self.norm_stats,
                     ctx.extras["config"], ctx.epoch,
                     {"val_loss": val_loss, "step": ctx.global_step},
+                    global_step=ctx.global_step,
                 )
         else:
             self.patience_counter += 1
@@ -145,12 +146,14 @@ class CheckpointCallback(TrainCallback):
                 "model_state_dict": ctx.model.state_dict(),
                 "optimizer_state_dict": ctx.optimizer.state_dict(),
                 "epoch": ctx.epoch,
+                "global_step": ctx.global_step,
                 "metrics": metrics,
             }, path)
         else:
             save_checkpoint(
                 path, ctx.model, ctx.optimizer,
                 norm_stats, config, ctx.epoch, metrics,
+                global_step=ctx.global_step,
             )
 
     def on_step(self, ctx):
