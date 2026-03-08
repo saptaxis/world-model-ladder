@@ -103,3 +103,16 @@ def test_dim_names_custom():
     cfg = RunConfig(arch="mlp", data_path="/tmp/data", state_dim=3,
                     dim_names=["px", "py", "theta"])
     assert cfg.dim_names == ["px", "py", "theta"]
+
+
+def test_validate_config_dim_names_length_mismatch():
+    cfg = RunConfig(arch="mlp", data_path="/tmp/data", state_dim=8,
+                    dim_names=["x", "y", "z"])  # only 3, need 8
+    with pytest.raises(ValueError, match="dim_names"):
+        validate_config(cfg)
+
+
+def test_validate_config_dim_names_length_ok():
+    cfg = RunConfig(arch="mlp", data_path="/tmp/data", state_dim=3,
+                    dim_names=["x", "y", "z"])
+    validate_config(cfg)  # should not raise

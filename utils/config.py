@@ -104,6 +104,10 @@ def validate_config(config: RunConfig) -> None:
                 f"rollout_k ({config.rollout_k}) exceeds seq_len ({config.seq_len}). "
                 f"Multi-step training can only roll out within the available sequence window."
             )
+    if config.dim_names is not None and len(config.dim_names) != config.state_dim:
+        raise ValueError(
+            f"dim_names has {len(config.dim_names)} entries but state_dim={config.state_dim}"
+        )
 
 
 def load_config(path: str, overrides: dict | None = None) -> RunConfig:
