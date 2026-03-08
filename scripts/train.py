@@ -35,7 +35,9 @@ from training.callbacks import (
     WarmupRolloutCallback,
 )
 from training.loop import train_epoch
+from training.profiler import ProfileLogger
 from training.scheduling import curriculum_schedule, sampling_schedule
+from training.torch_profiler import make_torch_profiler
 from utils.checkpoint import load_checkpoint, get_git_hash
 from utils.config import RunConfig, load_config, generate_run_name, validate_config
 from utils.logging import get_dim_names
@@ -64,6 +66,10 @@ def parse_args():
                         help="Disable callbacks (minimal epoch-based loop)")
     parser.add_argument("--dry_run", action="store_true",
                         help="Load config + data, print banner, exit before training")
+    parser.add_argument("--profile", action="store_true",
+                        help="Enable step profiler (writes profile.jsonl to run dir)")
+    parser.add_argument("--torch-profile", action="store_true",
+                        help="Enable torch.profiler Chrome traces (writes to torch_trace/)")
     return parser.parse_args()
 
 
@@ -141,6 +147,15 @@ def main():
     if args.dry_run:
         print("Dry run — exiting before training.")
         return
+
+    # Profiling
+    profiler = ProfileLogger(run_dir / "profile.jsonl" if args.profile else None)
+    torch_prof = make_torch_profiler(
+        enabled=args.torch_profile,
+        trace_dir=str(run_dir / "torch_trace"),
+    )
+    if torch_prof is not None:
+        torch_prof.start()
 
     # Optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
@@ -248,16 +263,16 @@ def main():
     # Training loop
     try:
         for epoch in range(start_epoch, config.epochs):
-            # Compute schedule values
-            current_k = config.rollout_k
-            current_sampling_prob = 0.0
-            if config.curriculum:
-                current_k = curriculum_schedule(epoch, config.epochs,
-                                                k_min=1, k_max=config.rollout_k)
-            if config.training_mode == "scheduled_sampling":
-                current_sampling_prob = sampling_schedule(
-                    epoch, config.epochs,
-                    start=config.sampling_start, end=config.sampling_end)
+            with profiler.phase("epoch/schedule", step=ctx.global_step, epoch=epoch):
+                current_k = config.rollout_k
+                current_sampling_prob = 0.0
+                if config.curriculum:
+                    current_k = curriculum_schedule(epoch, config.epochs,
+                                                    k_min=1, k_max=config.rollout_k)
+                if config.training_mode == "scheduled_sampling":
+                    current_sampling_prob = sampling_schedule(
+                        epoch, config.epochs,
+                        start=config.sampling_start, end=config.sampling_end)
 
             ctx.epoch = epoch
             train_metrics = train_epoch(
@@ -266,15 +281,16 @@ def main():
                 device=device, max_grad_norm=config.grad_clip,
                 sampling_prob=current_sampling_prob, kl_weight=config.kl_weight,
                 ctx=ctx, callbacks=callbacks,
+                profiler=profiler, torch_profiler=torch_prof,
             )
 
-            # Dispatch on_epoch_end callbacks
             stop_requested = stop_requested or train_metrics.get("stop_requested", False)
             if not stop_requested:
-                for cb in callbacks:
-                    if cb.on_epoch_end(ctx) is False:
-                        stop_requested = True
-                        break
+                with profiler.phase("epoch/on_epoch_end", step=ctx.global_step, epoch=epoch):
+                    for cb in callbacks:
+                        if cb.on_epoch_end(ctx) is False:
+                            stop_requested = True
+                            break
 
             if stop_requested:
                 break
@@ -284,6 +300,14 @@ def main():
         for cb in callbacks:
             cb.on_train_end(ctx)
         writer.close()
+        profiler.close()
+        if torch_prof is not None:
+            torch_prof.stop()
+            print(f"Torch traces written to {run_dir / 'torch_trace'}")
+        if args.profile:
+            import subprocess
+            subprocess.run([sys.executable, "scripts/profile_summary.py",
+                            str(run_dir / "profile.jsonl")])
 
     best_val = ctx.extras.get("val_loss", float("nan"))
     print(f"Done. Final val loss: {best_val:.6f}")
