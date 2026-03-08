@@ -165,6 +165,78 @@ def test_eval_script_smoke(episode_dir, tmp_path):
     assert metrics_json.exists()
 
 
+def test_callback_driven_training(episode_dir, tmp_path):
+    """End-to-end: train with full callback stack."""
+    from training.callbacks import (
+        CallbackContext, ValidationCallback, CheckpointCallback,
+        PerDimLossCallback, GradNormCallback,
+    )
+    from training.losses import single_step_loss
+
+    config = RunConfig(
+        arch="mlp", arch_params={"hidden_dims": [16]},
+        prediction="delta", training_mode="single_step",
+        data_path=str(episode_dir), state_dim=8, action_dim=2,
+        lr=1e-3, batch_size=8, epochs=3, val_fraction=0.2,
+        run_dir=str(tmp_path),
+    )
+
+    train_ds = EpisodeDataset(config.data_path, state_dim=8,
+                              mode="single_step", split="train", val_fraction=0.2)
+    val_ds = EpisodeDataset(config.data_path, state_dim=8,
+                            mode="single_step", split="val", val_fraction=0.2)
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=8)
+    norm_stats = compute_norm_stats(train_ds.episode_dicts())
+
+    model = build_model(config)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr)
+
+    callbacks = [
+        ValidationCallback(val_loader, norm_stats, every_n_steps=5, patience=100),
+        CheckpointCallback(str(tmp_path / "ckpts"), every_n_steps=10),
+        PerDimLossCallback(val_loader, norm_stats, every_n_steps=5),
+        GradNormCallback(every_n_steps=5),
+    ]
+
+    ctx = CallbackContext(
+        model=model, optimizer=optimizer, writer=None,
+        global_step=0, epoch=0, run_dir=str(tmp_path), device="cpu",
+    )
+    ctx.extras["config"] = config
+    ctx.extras["norm_stats"] = norm_stats
+
+    for cb in callbacks:
+        cb.on_train_start(ctx)
+
+    global_step = 0
+    for epoch in range(3):
+        model.train()
+        for batch in train_loader:
+            loss = single_step_loss(model, batch, norm_stats)
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            global_step += 1
+            ctx.global_step = global_step
+            ctx.epoch = epoch
+            ctx.extras["train_loss_step"] = loss.item()
+            for cb in callbacks:
+                cb.on_step(ctx)
+            optimizer.step()
+        for cb in callbacks:
+            cb.on_epoch_end(ctx)
+
+    for cb in callbacks:
+        cb.on_train_end(ctx)
+
+    # Verify callbacks produced output
+    assert "val_loss" in ctx.extras
+    assert "per_dim_mse" in ctx.extras
+    assert "grad_norms" in ctx.extras
+    assert (tmp_path / "ckpts" / "latest.pt").exists()
+
+
 def test_gru_multi_step_integration(episode_dir, tmp_path):
     """End-to-end: train GRU with multi-step loss."""
     config = RunConfig(
