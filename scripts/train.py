@@ -38,6 +38,7 @@ from training.loop import train_epoch
 from training.scheduling import curriculum_schedule, sampling_schedule
 from utils.checkpoint import load_checkpoint, get_git_hash
 from utils.config import RunConfig, load_config, generate_run_name, validate_config
+from utils.logging import get_dim_names
 
 
 def parse_args():
@@ -182,6 +183,7 @@ def main():
             val_loader=val_loader_ss,
             norm_stats=norm_stats,
             every_n_steps=config.val_every,
+            dim_names=get_dim_names(config.dim_names, config.state_dim),
         ))
         callbacks.append(RolloutMetricsCallback(
             dataset=val_ds,

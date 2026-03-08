@@ -50,6 +50,9 @@ class RunConfig:
     seq_len: int = 50
     val_fraction: float = 0.1
 
+    # Dimension names for per-dim logging (None = generic dim_0, dim_1, ...)
+    dim_names: list[str] | None = None
+
     # Output
     run_dir: str = "runs/"
     suffix: str = ""

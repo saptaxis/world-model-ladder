@@ -4,6 +4,13 @@ from __future__ import annotations
 DIM_NAMES_8D = ["x", "y", "vx", "vy", "angle", "angular_vel", "left_leg", "right_leg"]
 
 
+def get_dim_names(dim_names: list[str] | None, state_dim: int) -> list[str]:
+    """Return dimension names, falling back to generic names."""
+    if dim_names is not None:
+        return dim_names[:state_dim]
+    return [f"dim_{i}" for i in range(state_dim)]
+
+
 class TrainLogger:
     """Thin wrapper around TensorBoard SummaryWriter."""
 

@@ -1,5 +1,5 @@
 from unittest.mock import MagicMock
-from utils.logging import TrainLogger
+from utils.logging import TrainLogger, get_dim_names
 
 
 def test_logger_log_scalar():
@@ -27,3 +27,13 @@ def test_logger_log_dict():
     logger.log_dict({"a": 1.0, "b": 2.0}, prefix="metrics", step=3)
     assert writer.add_scalar.call_count == 2
     writer.add_scalar.assert_any_call("metrics/a", 1.0, 3)
+
+
+def test_get_dim_names_none_returns_generic():
+    names = get_dim_names(None, state_dim=4)
+    assert names == ["dim_0", "dim_1", "dim_2", "dim_3"]
+
+
+def test_get_dim_names_custom():
+    names = get_dim_names(["x", "y", "vx"], state_dim=3)
+    assert names == ["x", "y", "vx"]

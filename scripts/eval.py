@@ -24,7 +24,7 @@ from evaluation.metrics.core import (
     horizon_to_failure,
 )
 from utils.checkpoint import load_checkpoint
-from utils.logging import DIM_NAMES_8D
+from utils.logging import get_dim_names
 from utils.plotting import plot_horizon_curve, plot_per_dim_bars
 from utils.reporting import generate_eval_report
 
@@ -67,7 +67,7 @@ def main():
                             val_fraction=config.val_fraction)
     val_loader = DataLoader(val_ds, batch_size=config.batch_size)
 
-    dim_names = DIM_NAMES_8D[:config.state_dim]
+    dim_names = get_dim_names(getattr(config, 'dim_names', None), config.state_dim)
     results = {}
 
     # Eval A: per-dim MSE

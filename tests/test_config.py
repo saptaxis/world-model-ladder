@@ -91,3 +91,15 @@ def test_validate_config_single_step_skips_rollout_k_check():
     cfg = RunConfig(arch="mlp", data_path="/tmp/data",
                     training_mode="single_step", rollout_k=999, seq_len=50)
     validate_config(cfg)  # should not raise
+
+
+def test_dim_names_default_generic():
+    """Default dim_names are generic dim_0, dim_1, etc."""
+    cfg = RunConfig(arch="mlp", data_path="/tmp/data", state_dim=4)
+    assert cfg.dim_names is None  # None means "use generic"
+
+
+def test_dim_names_custom():
+    cfg = RunConfig(arch="mlp", data_path="/tmp/data", state_dim=3,
+                    dim_names=["px", "py", "theta"])
+    assert cfg.dim_names == ["px", "py", "theta"]
