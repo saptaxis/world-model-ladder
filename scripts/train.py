@@ -310,7 +310,8 @@ def main():
             print(f"Torch traces written to {run_dir / 'torch_trace'}")
         if args.profile:
             import subprocess
-            subprocess.run([sys.executable, "scripts/profile_summary.py",
+            summary_script = Path(__file__).parent / "profile_summary.py"
+            subprocess.run([sys.executable, str(summary_script),
                             str(run_dir / "profile.jsonl")])
 
     best_val = ctx.extras.get("val_loss", float("nan"))
