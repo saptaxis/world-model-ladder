@@ -53,40 +53,44 @@ def multi_step_loss(model, batch, norm_stats: NormStats, k: int,
                     dim_weights: str | None = None) -> torch.Tensor:
     """MSE on k-step autoregressive rollout.
 
-    Rollout in RAW space: at each step, normalize state for model input,
-    get delta-normalized prediction, denormalize delta back to raw, accumulate.
-    This avoids conflating state normalization and delta normalization.
+    Rollout in NORMALIZED space: the model receives and produces normalized
+    values. State accumulation stays in normalized space throughout, avoiding
+    the raw-space round-trip that creates unstable gradients.
 
-    Does NOT use rollout_open_loop (which is normalization-unaware).
-    Backpropagates through the entire k-step chain.
+    State update: s_{t+1}_normalized = s_t_normalized + (delta_n * delta_std + delta_mean) / state_std
 
     Args:
         batch: (state_seq, action_seq) where state_seq is [batch, T+1, state_dim]
                and action_seq is [batch, T, action_dim]
         norm_stats: normalization statistics
         k: number of rollout steps
+        dim_weights: "inv_var" for per-dim weighting, None for uniform MSE
     """
     state_seq, action_seq = batch
     s0 = state_seq[:, 0]
     actions_k = action_seq[:, :k]
     true_states_k = state_seq[:, :k + 1]
 
-    # Rollout in raw space with normalize/denormalize at each step
-    pred_deltas_raw = []
-    s = s0
+    delta_std = norm_stats.delta_std
+    delta_mean = norm_stats.delta_mean
+    state_std = norm_stats.state_std
+    state_mean = norm_stats.state_mean
+
+    # Rollout in normalized space
+    pred_deltas_n = []
+    s_n = normalize(s0, state_mean, state_std)
     model_state = None
     for t in range(k):
-        s_n = normalize(s, norm_stats.state_mean, norm_stats.state_std)
         delta_n, model_state = model.step(s_n, actions_k[:, t], model_state)
-        delta_raw = denormalize(delta_n, norm_stats.delta_mean, norm_stats.delta_std)
-        s = s + delta_raw
-        pred_deltas_raw.append(delta_raw)
-    pred_deltas_raw = torch.stack(pred_deltas_raw, dim=1)
+        pred_deltas_n.append(delta_n)
+        # Accumulate in normalized space:
+        delta_raw = delta_n * (delta_std + 1e-8) + delta_mean
+        s_n = s_n + delta_raw / (state_std + 1e-8)
+    pred_deltas_n = torch.stack(pred_deltas_n, dim=1)
 
     # Loss in delta-normalized space
     true_deltas = true_states_k[:, 1:] - true_states_k[:, :-1]
-    true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
-    pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
+    true_deltas_n = normalize(true_deltas, delta_mean, delta_std)
 
     w = _compute_dim_weights(dim_weights, norm_stats)
     return _weighted_mse(pred_deltas_n, true_deltas_n, w)
@@ -95,47 +99,38 @@ def multi_step_loss(model, batch, norm_stats: NormStats, k: int,
 def scheduled_sampling_loss(model, batch, norm_stats: NormStats,
                             k: int, sampling_prob: float,
                             dim_weights: str | None = None) -> torch.Tensor:
-    """MSE on k-step rollout with scheduled sampling.
-
-    Like multi_step_loss but at each step, with probability sampling_prob,
-    the model uses its own predicted state instead of the true state.
-    Uses teacher-forced true states otherwise. Rolls out in raw space.
-
-    Only meaningful for recurrent models — the hidden state evolves
-    regardless of whether the state input is true or predicted.
-
-    Args:
-        batch: (state_seq, action_seq) where state_seq is [batch, T+1, state_dim]
-        norm_stats: normalization statistics
-        k: number of rollout steps
-        sampling_prob: probability of using model's own prediction (0=teacher forced)
-    """
+    """MSE on k-step rollout with scheduled sampling."""
     state_seq, action_seq = batch
     s0 = state_seq[:, 0]
     actions_k = action_seq[:, :k]
     true_states_k = state_seq[:, :k + 1]
 
-    pred_deltas_raw = []
-    s = s0
+    delta_std = norm_stats.delta_std
+    delta_mean = norm_stats.delta_mean
+    state_std = norm_stats.state_std
+    state_mean = norm_stats.state_mean
+
+    pred_deltas_n = []
+    s_n = normalize(s0, state_mean, state_std)
     model_state = model.initial_state(s0.shape[0], device=s0.device)
 
     for t in range(k):
-        s_n = normalize(s, norm_stats.state_mean, norm_stats.state_std)
         delta_n, model_state = model.step(s_n, actions_k[:, t], model_state)
-        delta_raw = denormalize(delta_n, norm_stats.delta_mean, norm_stats.delta_std)
-        s_pred = s + delta_raw
-        pred_deltas_raw.append(delta_raw)
-
-        # Next input: true state or model prediction
+        pred_deltas_n.append(delta_n)
+        # Predicted next state in normalized space
+        delta_raw = delta_n * (delta_std + 1e-8) + delta_mean
+        s_n_pred = s_n + delta_raw / (state_std + 1e-8)
+        # Scheduled sampling: use true or predicted
         if t + 1 < k:
             use_pred = torch.rand(1).item() < sampling_prob
-            s = s_pred if use_pred else true_states_k[:, t + 1]
+            if use_pred:
+                s_n = s_n_pred
+            else:
+                s_n = normalize(true_states_k[:, t + 1], state_mean, state_std)
 
-    pred_deltas_raw = torch.stack(pred_deltas_raw, dim=1)
-
+    pred_deltas_n = torch.stack(pred_deltas_n, dim=1)
     true_deltas = true_states_k[:, 1:] - true_states_k[:, :-1]
-    true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
-    pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
+    true_deltas_n = normalize(true_deltas, delta_mean, delta_std)
 
     w = _compute_dim_weights(dim_weights, norm_stats)
     return _weighted_mse(pred_deltas_n, true_deltas_n, w)
@@ -144,48 +139,35 @@ def scheduled_sampling_loss(model, batch, norm_stats: NormStats,
 def elbo_loss(model, batch, norm_stats: NormStats, k: int,
               kl_weight: float = 1.0,
               dim_weights: str | None = None) -> torch.Tensor:
-    """ELBO loss for RSSM: reconstruction + KL divergence.
-
-    Reconstruction: same as multi_step_loss but passing model_state through
-    so the RSSM accumulates posterior information.
-
-    KL: averaged over all timesteps.
-
-    Args:
-        model: RSSM model (must have kl_loss method)
-        batch: (state_seq, action_seq)
-        norm_stats: normalization statistics
-        k: number of rollout steps
-        kl_weight: weight for KL term (beta in beta-VAE)
-    """
+    """ELBO loss for RSSM: reconstruction + KL divergence."""
     state_seq, action_seq = batch
     s0 = state_seq[:, 0]
     actions_k = action_seq[:, :k]
     true_states_k = state_seq[:, :k + 1]
 
-    pred_deltas_raw = []
+    delta_std = norm_stats.delta_std
+    delta_mean = norm_stats.delta_mean
+    state_std = norm_stats.state_std
+    state_mean = norm_stats.state_mean
+
+    pred_deltas_n = []
     kl_terms = []
-    s = s0
+    s_n = normalize(s0, state_mean, state_std)
     model_state = model.initial_state(s0.shape[0], device=s0.device)
 
     for t in range(k):
-        s_n = normalize(s, norm_stats.state_mean, norm_stats.state_std)
         delta_n, model_state = model.step(s_n, actions_k[:, t], model_state)
-        delta_raw = denormalize(delta_n, norm_stats.delta_mean, norm_stats.delta_std)
-        s = s + delta_raw
-        pred_deltas_raw.append(delta_raw)
+        pred_deltas_n.append(delta_n)
         kl_terms.append(model.kl_loss(model_state))
+        delta_raw = delta_n * (delta_std + 1e-8) + delta_mean
+        s_n = s_n + delta_raw / (state_std + 1e-8)
 
-    pred_deltas_raw = torch.stack(pred_deltas_raw, dim=1)
-
-    # Reconstruction loss in delta-normalized space
+    pred_deltas_n = torch.stack(pred_deltas_n, dim=1)
     true_deltas = true_states_k[:, 1:] - true_states_k[:, :-1]
-    true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
-    pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
+    true_deltas_n = normalize(true_deltas, delta_mean, delta_std)
+
     w = _compute_dim_weights(dim_weights, norm_stats)
     recon_loss = _weighted_mse(pred_deltas_n, true_deltas_n, w)
-
-    # KL loss averaged over timesteps
     kl_loss = torch.stack(kl_terms).mean()
 
     return recon_loss + kl_weight * kl_loss
