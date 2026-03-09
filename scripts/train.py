@@ -58,6 +58,7 @@ def parse_args():
     parser.add_argument("--ckpt_every", type=int, default=None)
     parser.add_argument("--plot_every", type=int, default=None)
     parser.add_argument("--grad_clip", type=float, default=None)
+    parser.add_argument("--dim_weights", type=str, default=None)
     # Pure CLI flags (not in config)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None,
@@ -79,7 +80,8 @@ def main():
     # Build overrides dict from non-None CLI args
     overrides = {}
     for field in ["rollout_k", "lr", "batch_size", "epochs", "suffix", "kl_weight",
-                   "val_every", "patience", "ckpt_every", "plot_every", "grad_clip"]:
+                   "val_every", "patience", "ckpt_every", "plot_every", "grad_clip",
+                   "dim_weights"]:
         val = getattr(args, field)
         if val is not None:
             overrides[field] = val
@@ -189,6 +191,7 @@ def main():
             checkpoint_dir=str(run_dir),
             rollout_k=config.rollout_k,
             kl_weight=config.kl_weight,
+            dim_weights=config.dim_weights,
         ))
         callbacks.append(CheckpointCallback(
             checkpoint_dir=str(run_dir),
@@ -280,6 +283,7 @@ def main():
                 training_mode=config.training_mode, rollout_k=current_k,
                 device=device, max_grad_norm=config.grad_clip,
                 sampling_prob=current_sampling_prob, kl_weight=config.kl_weight,
+                dim_weights=config.dim_weights,
                 ctx=ctx, callbacks=callbacks,
                 profiler=profiler, torch_profiler=torch_prof,
             )

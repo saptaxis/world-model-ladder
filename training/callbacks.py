@@ -61,7 +61,8 @@ class ValidationCallback(TrainCallback):
                  every_n_steps: int = 500, patience: int = 10,
                  checkpoint_dir: str | None = None,
                  rollout_k: int = 1, sampling_prob: float = 0.0,
-                 kl_weight: float = 1.0):
+                 kl_weight: float = 1.0,
+                 dim_weights: str | None = None):
         self.val_loader = val_loader
         self.norm_stats = norm_stats
         self.training_mode = training_mode
@@ -71,6 +72,7 @@ class ValidationCallback(TrainCallback):
         self.rollout_k = rollout_k
         self.sampling_prob = sampling_prob
         self.kl_weight = kl_weight
+        self.dim_weights = dim_weights
         self.best_val_loss = float("inf")
         self.patience_counter = 0
         self.last_val_step = -1
@@ -95,6 +97,7 @@ class ValidationCallback(TrainCallback):
             training_mode=self.training_mode, rollout_k=self.rollout_k,
             device=ctx.device, sampling_prob=self.sampling_prob,
             kl_weight=self.kl_weight,
+            dim_weights=self.dim_weights,
             compute_per_dim=(self.training_mode == "single_step"),
         )
         val_loss = val_metrics["val_loss"]

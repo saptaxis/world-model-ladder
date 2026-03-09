@@ -6,7 +6,7 @@ import time
 import torch
 
 from data.normalization import NormStats
-from training.losses import single_step_loss, multi_step_loss, scheduled_sampling_loss, elbo_loss
+from training.losses import single_step_loss, multi_step_loss, scheduled_sampling_loss, elbo_loss, _weighted_mse, _compute_dim_weights
 from training.profiler import ProfileLogger
 
 
@@ -14,6 +14,7 @@ def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
                 training_mode: str = "single_step", rollout_k: int = 1,
                 device: str = "cpu", max_grad_norm: float = 1.0,
                 sampling_prob: float = 0.0, kl_weight: float = 1.0,
+                dim_weights: str | None = None,
                 ctx=None, callbacks=None,
                 profiler: ProfileLogger | None = None,
                 torch_profiler=None) -> dict:
@@ -76,14 +77,14 @@ def train_epoch(model, train_loader, optimizer, norm_stats: NormStats,
 
         with _prof.phase("forward", step=_step(), epoch=_epoch()):
             if training_mode == "single_step":
-                loss = single_step_loss(model, batch, ns)
+                loss = single_step_loss(model, batch, ns, dim_weights=dim_weights)
             elif training_mode == "multi_step":
-                loss = multi_step_loss(model, batch, ns, k=rollout_k)
+                loss = multi_step_loss(model, batch, ns, k=rollout_k, dim_weights=dim_weights)
             elif training_mode == "scheduled_sampling":
                 loss = scheduled_sampling_loss(model, batch, ns, k=rollout_k,
-                                               sampling_prob=sampling_prob)
+                                               sampling_prob=sampling_prob, dim_weights=dim_weights)
             elif training_mode == "elbo":
-                loss = elbo_loss(model, batch, ns, k=rollout_k, kl_weight=kl_weight)
+                loss = elbo_loss(model, batch, ns, k=rollout_k, kl_weight=kl_weight, dim_weights=dim_weights)
             else:
                 raise ValueError(
                     f"Unsupported training_mode: {training_mode}. "
@@ -130,6 +131,7 @@ def validate(model, val_loader, norm_stats: NormStats,
              training_mode: str = "single_step", rollout_k: int = 1,
              device: str = "cpu", sampling_prob: float = 0.0,
              kl_weight: float = 1.0,
+             dim_weights: str | None = None,
              compute_per_dim: bool = False) -> dict:
     """Run validation. Same loss computation as training, no gradient.
 
@@ -163,19 +165,20 @@ def validate(model, val_loader, norm_stats: NormStats,
                 obs_n = normalize(obs, ns.state_mean, ns.state_std)
                 pred_deltas_n, _ = model.step(obs_n, actions)
                 true_deltas_n = normalize(true_deltas, ns.delta_mean, ns.delta_std)
-                loss = torch.nn.functional.mse_loss(pred_deltas_n, true_deltas_n)
+                w = _compute_dim_weights(dim_weights, ns)
+                loss = _weighted_mse(pred_deltas_n, true_deltas_n, w)
                 # Per-dim in raw space (matches per_dim_mse() semantics)
                 pred_deltas = denormalize(pred_deltas_n, ns.delta_mean, ns.delta_std)
                 all_sq_errors.append((pred_deltas - true_deltas).pow(2).cpu())
             else:
-                loss = single_step_loss(model, batch, ns)
+                loss = single_step_loss(model, batch, ns, dim_weights=dim_weights)
         elif training_mode == "multi_step":
-            loss = multi_step_loss(model, batch, ns, k=rollout_k)
+            loss = multi_step_loss(model, batch, ns, k=rollout_k, dim_weights=dim_weights)
         elif training_mode == "scheduled_sampling":
             loss = scheduled_sampling_loss(model, batch, ns, k=rollout_k,
-                                           sampling_prob=sampling_prob)
+                                           sampling_prob=sampling_prob, dim_weights=dim_weights)
         elif training_mode == "elbo":
-            loss = elbo_loss(model, batch, ns, k=rollout_k, kl_weight=kl_weight)
+            loss = elbo_loss(model, batch, ns, k=rollout_k, kl_weight=kl_weight, dim_weights=dim_weights)
         else:
             raise ValueError(
                 f"Unsupported training_mode: {training_mode}. "

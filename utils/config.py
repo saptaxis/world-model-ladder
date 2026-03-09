@@ -24,6 +24,7 @@ class RunConfig:
     sampling_end: float = 0.5
     curriculum: bool = False
     kl_weight: float = 1.0              # KL weight for ELBO loss
+    dim_weights: str | None = None      # "inv_var" for 1/delta_std^2, None for uniform
 
     # Callback frequencies
     val_every: int = 500
