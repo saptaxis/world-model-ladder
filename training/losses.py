@@ -7,7 +7,32 @@ import torch.nn.functional as F
 from data.normalization import NormStats, normalize, denormalize
 
 
-def single_step_loss(model, batch, norm_stats: NormStats) -> torch.Tensor:
+def _compute_dim_weights(
+    dim_weights: str | None,
+    norm_stats: NormStats,
+) -> torch.Tensor | None:
+    """Compute per-dimension loss weights."""
+    if dim_weights is None:
+        return None
+    if dim_weights == "inv_var":
+        inv_var = 1.0 / (norm_stats.delta_std ** 2 + 1e-8)
+        weights = inv_var / inv_var.mean()
+        return weights
+    raise ValueError(f"Unknown dim_weights: {dim_weights}. Use 'inv_var' or None.")
+
+
+def _weighted_mse(pred: torch.Tensor, target: torch.Tensor,
+                  weights: torch.Tensor | None) -> torch.Tensor:
+    """MSE loss with optional per-dim weighting."""
+    if weights is None:
+        return F.mse_loss(pred, target)
+    sq_err = (pred - target) ** 2
+    weighted = sq_err * weights
+    return weighted.mean()
+
+
+def single_step_loss(model, batch, norm_stats: NormStats,
+                     dim_weights: str | None = None) -> torch.Tensor:
     """MSE on single-step delta prediction.
 
     Model contract: receives state-normalized obs, outputs delta-normalized delta.
@@ -20,10 +45,12 @@ def single_step_loss(model, batch, norm_stats: NormStats) -> torch.Tensor:
     obs_n = normalize(obs, norm_stats.state_mean, norm_stats.state_std)
     pred_deltas_n, _ = model.step(obs_n, actions)
     true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
-    return F.mse_loss(pred_deltas_n, true_deltas_n)
+    w = _compute_dim_weights(dim_weights, norm_stats)
+    return _weighted_mse(pred_deltas_n, true_deltas_n, w)
 
 
-def multi_step_loss(model, batch, norm_stats: NormStats, k: int) -> torch.Tensor:
+def multi_step_loss(model, batch, norm_stats: NormStats, k: int,
+                    dim_weights: str | None = None) -> torch.Tensor:
     """MSE on k-step autoregressive rollout.
 
     Rollout in RAW space: at each step, normalize state for model input,
@@ -61,11 +88,13 @@ def multi_step_loss(model, batch, norm_stats: NormStats, k: int) -> torch.Tensor
     true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
     pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
 
-    return F.mse_loss(pred_deltas_n, true_deltas_n)
+    w = _compute_dim_weights(dim_weights, norm_stats)
+    return _weighted_mse(pred_deltas_n, true_deltas_n, w)
 
 
 def scheduled_sampling_loss(model, batch, norm_stats: NormStats,
-                            k: int, sampling_prob: float) -> torch.Tensor:
+                            k: int, sampling_prob: float,
+                            dim_weights: str | None = None) -> torch.Tensor:
     """MSE on k-step rollout with scheduled sampling.
 
     Like multi_step_loss but at each step, with probability sampling_prob,
@@ -108,11 +137,13 @@ def scheduled_sampling_loss(model, batch, norm_stats: NormStats,
     true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
     pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
 
-    return F.mse_loss(pred_deltas_n, true_deltas_n)
+    w = _compute_dim_weights(dim_weights, norm_stats)
+    return _weighted_mse(pred_deltas_n, true_deltas_n, w)
 
 
 def elbo_loss(model, batch, norm_stats: NormStats, k: int,
-              kl_weight: float = 1.0) -> torch.Tensor:
+              kl_weight: float = 1.0,
+              dim_weights: str | None = None) -> torch.Tensor:
     """ELBO loss for RSSM: reconstruction + KL divergence.
 
     Reconstruction: same as multi_step_loss but passing model_state through
@@ -151,7 +182,8 @@ def elbo_loss(model, batch, norm_stats: NormStats, k: int,
     true_deltas = true_states_k[:, 1:] - true_states_k[:, :-1]
     true_deltas_n = normalize(true_deltas, norm_stats.delta_mean, norm_stats.delta_std)
     pred_deltas_n = normalize(pred_deltas_raw, norm_stats.delta_mean, norm_stats.delta_std)
-    recon_loss = F.mse_loss(pred_deltas_n, true_deltas_n)
+    w = _compute_dim_weights(dim_weights, norm_stats)
+    recon_loss = _weighted_mse(pred_deltas_n, true_deltas_n, w)
 
     # KL loss averaged over timesteps
     kl_loss = torch.stack(kl_terms).mean()

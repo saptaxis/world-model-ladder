@@ -230,3 +230,61 @@ def test_elbo_loss_kl_weight():
     # Can't guarantee ordering due to randomness in sampling, but both should be finite
     assert loss_low.isfinite()
     assert loss_high.isfinite()
+
+
+def test_single_step_loss_with_dim_weights():
+    """Inverse-variance weighting changes the loss value."""
+    torch.manual_seed(42)
+    model = MLPModel(state_dim=6, action_dim=2, hidden_dims=[32])
+    batch = (torch.randn(16, 6), torch.randn(16, 2), torch.randn(16, 6))
+    ns = NormStats(
+        state_mean=torch.zeros(6),
+        state_std=torch.ones(6),
+        delta_mean=torch.zeros(6),
+        delta_std=torch.tensor([0.01, 0.07, 0.03, 0.02, 0.008, 0.04]),
+    )
+    model.eval()
+    with torch.no_grad():
+        loss_weighted = single_step_loss(model, batch, ns, dim_weights="inv_var")
+        loss_uniform = single_step_loss(model, batch, ns, dim_weights=None)
+    assert loss_weighted.isfinite()
+    assert loss_uniform.isfinite()
+    assert loss_weighted.item() != loss_uniform.item()
+
+
+def test_multi_step_loss_with_dim_weights():
+    """Inverse-variance weighting works with multi-step loss."""
+    torch.manual_seed(42)
+    model = MLPModel(state_dim=6, action_dim=2, hidden_dims=[32])
+    state_seq = torch.randn(4, 6, 6)
+    action_seq = torch.randn(4, 5, 2)
+    batch = (state_seq, action_seq)
+    ns = NormStats(
+        state_mean=torch.zeros(6),
+        state_std=torch.ones(6),
+        delta_mean=torch.zeros(6),
+        delta_std=torch.tensor([0.01, 0.07, 0.03, 0.02, 0.008, 0.04]),
+    )
+    model.eval()
+    with torch.no_grad():
+        loss_weighted = multi_step_loss(model, batch, ns, k=5, dim_weights="inv_var")
+        loss_uniform = multi_step_loss(model, batch, ns, k=5, dim_weights=None)
+    assert loss_weighted.isfinite()
+    assert loss_uniform.isfinite()
+    assert loss_weighted.item() != loss_uniform.item()
+
+
+def test_dim_weights_none_matches_default():
+    """dim_weights=None gives same result as before (backward compat)."""
+    torch.manual_seed(42)
+    model = MLPModel(state_dim=6, action_dim=2, hidden_dims=[32])
+    batch = (torch.randn(16, 6), torch.randn(16, 2), torch.randn(16, 6))
+    ns = NormStats(
+        state_mean=torch.zeros(6), state_std=torch.ones(6),
+        delta_mean=torch.zeros(6), delta_std=torch.ones(6),
+    )
+    model.eval()
+    with torch.no_grad():
+        loss_default = single_step_loss(model, batch, ns)
+        loss_none = single_step_loss(model, batch, ns, dim_weights=None)
+    assert torch.allclose(loss_default, loss_none)
