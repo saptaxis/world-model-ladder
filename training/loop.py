@@ -145,6 +145,7 @@ def validate(model, val_loader, norm_stats: NormStats,
     """
     from data.normalization import normalize, denormalize
 
+    was_training = model.training
     model.eval()
     total_loss = 0.0
     n_batches = 0
@@ -187,6 +188,9 @@ def validate(model, val_loader, norm_stats: NormStats,
 
         total_loss += loss.item()
         n_batches += 1
+
+    if was_training:
+        model.train()
 
     result = {"val_loss": total_loss / max(n_batches, 1)}
     if per_dim and all_sq_errors:
