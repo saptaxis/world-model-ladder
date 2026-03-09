@@ -25,6 +25,7 @@ class EpisodeDataset(Dataset):
         split: "train", "val", or None (all data)
         val_fraction: fraction of episodes reserved for validation
         seed: seed for deterministic train/val split
+        subsample: take every Nth frame (1 = no subsampling, 5 = 10 FPS from 50 FPS)
     """
 
     def __init__(
@@ -36,11 +37,13 @@ class EpisodeDataset(Dataset):
         split: str | None = None,
         val_fraction: float = 0.1,
         seed: int = 0,
+        subsample: int = 1,
     ):
         self.state_dim = state_dim
         self.action_dim = 2
         self.mode = mode
         self.seq_len = seq_len
+        self.subsample = subsample
 
         # Load all .npz files sorted for deterministic ordering
         npz_paths = sorted(Path(data_path).glob("**/*.npz"))
@@ -71,6 +74,16 @@ class EpisodeDataset(Dataset):
                 continue
             s = d["states"][:, :state_dim].astype(np.float32)
             a = d["actions"].astype(np.float32)
+            # Subsample: take every Nth frame. Actions are averaged over
+            # each window (mean thrust level over the interval).
+            if subsample > 1:
+                T = len(a)
+                n_steps = T // subsample
+                a_sub = np.zeros((n_steps, a.shape[1]), dtype=np.float32)
+                for j in range(n_steps):
+                    a_sub[j] = a[j * subsample:(j + 1) * subsample].mean(axis=0)
+                s = s[::subsample][:n_steps + 1]
+                a = a_sub
             self.states.append(s)
             self.actions.append(a)
             self.deltas.append((s[1:] - s[:-1]).astype(np.float32))

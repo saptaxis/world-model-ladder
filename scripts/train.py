@@ -59,6 +59,7 @@ def parse_args():
     parser.add_argument("--plot_every", type=int, default=None)
     parser.add_argument("--grad_clip", type=float, default=None)
     parser.add_argument("--dim_weights", type=str, default=None)
+    parser.add_argument("--subsample", type=int, default=None)
     # Pure CLI flags (not in config)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None,
@@ -81,7 +82,7 @@ def main():
     overrides = {}
     for field in ["rollout_k", "lr", "batch_size", "epochs", "suffix", "kl_weight",
                    "val_every", "patience", "ckpt_every", "plot_every", "grad_clip",
-                   "dim_weights"]:
+                   "dim_weights", "subsample"]:
         val = getattr(args, field)
         if val is not None:
             overrides[field] = val
@@ -120,22 +121,27 @@ def main():
 
     train_ds = EpisodeDataset(config.data_path, state_dim=config.state_dim,
                               mode=data_mode, seq_len=seq_len, split="train",
-                              val_fraction=config.val_fraction)
+                              val_fraction=config.val_fraction,
+                              subsample=config.subsample)
     val_ds = EpisodeDataset(config.data_path, state_dim=config.state_dim,
                             mode=data_mode, seq_len=seq_len, split="val",
-                            val_fraction=config.val_fraction)
+                            val_fraction=config.val_fraction,
+                            subsample=config.subsample)
 
     train_loader = DataLoader(train_ds, batch_size=config.batch_size,
                               shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=config.batch_size)
 
+    if config.subsample > 1:
+        print(f"Subsample: {config.subsample}x ({50 // config.subsample} FPS effective)")
     print(f"Train: {train_ds.n_episodes} episodes, {len(train_ds)} samples")
     print(f"Val: {val_ds.n_episodes} episodes, {len(val_ds)} samples")
 
     # Also need single_step val loader for per-dim MSE (regardless of training mode)
     val_ds_ss = EpisodeDataset(config.data_path, state_dim=config.state_dim,
                                mode="single_step", split="val",
-                               val_fraction=config.val_fraction)
+                               val_fraction=config.val_fraction,
+                               subsample=config.subsample)
     val_loader_ss = DataLoader(val_ds_ss, batch_size=config.batch_size)
 
     # Normalization stats from training data
@@ -200,7 +206,7 @@ def main():
         callbacks.append(PerDimLossCallback(
             val_loader=val_loader_ss,
             norm_stats=norm_stats,
-            every_n_steps=config.val_every,
+            every_n_steps=config.rollout_every,
             dim_names=get_dim_names(config.dim_names, config.state_dim),
         ))
         callbacks.append(RolloutMetricsCallback(
@@ -219,12 +225,12 @@ def main():
             callbacks.append(PerTimestepLossCallback(
                 val_loader=val_loader,
                 norm_stats=norm_stats,
-                every_n_steps=config.val_every,
+                every_n_steps=config.rollout_every,
             ))
             callbacks.append(HiddenStateHealthCallback(
                 dataset=val_ds,
                 norm_stats=norm_stats,
-                every_n_steps=config.val_every,
+                every_n_steps=config.rollout_every,
             ))
             callbacks.append(WarmupRolloutCallback(
                 dataset=val_ds,

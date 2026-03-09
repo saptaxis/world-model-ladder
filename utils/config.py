@@ -39,6 +39,7 @@ class RunConfig:
     # Data
     data_mix: str = "policy"            # "policy" | "policy_primitives"
     data_path: str = ""                 # required — validated in __post_init__
+    subsample: int = 1                  # take every Nth frame (1 = no subsampling)
 
     # Environment
     state_dim: int = 8
