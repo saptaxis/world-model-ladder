@@ -37,8 +37,8 @@ class RunConfig:
     grad_clip: float = 1.0
 
     # Data
-    data_mix: str = "policy"            # "policy" | "policy_primitives"
-    data_path: str = ""                 # required — validated in __post_init__
+    data_mix: str = "policy"            # "policy" | "primitives" | "policy_primitives"
+    data_path: str | list[str] = ""     # single path or list of paths — validated in __post_init__
     subsample: int = 1                  # take every Nth frame (1 = no subsampling)
 
     # Environment
@@ -60,8 +60,16 @@ class RunConfig:
     suffix: str = ""
 
     def __post_init__(self):
-        if not self.data_path:
-            raise ValueError("data_path is required (got empty string)")
+        # Normalize data_path: single string → list of one
+        if isinstance(self.data_path, str):
+            if not self.data_path:
+                raise ValueError("data_path is required (got empty string)")
+            self.data_path = [self.data_path]
+        elif isinstance(self.data_path, list):
+            if not self.data_path:
+                raise ValueError("data_path is required (got empty list)")
+        else:
+            raise TypeError(f"data_path must be str or list[str], got {type(self.data_path)}")
 
     def save(self, path: str | Path):
         """Save config as YAML."""

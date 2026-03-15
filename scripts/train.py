@@ -132,6 +132,10 @@ def main():
                               shuffle=True, drop_last=True)
     val_loader = DataLoader(val_ds, batch_size=config.batch_size)
 
+    # Data summary
+    paths = config.data_path if isinstance(config.data_path, list) else [config.data_path]
+    for dp in paths:
+        print(f"Data: {dp}")
     if config.subsample > 1:
         print(f"Subsample: {config.subsample}x ({50 // config.subsample} FPS effective)")
     print(f"Train: {train_ds.n_episodes} episodes, {len(train_ds)} samples")

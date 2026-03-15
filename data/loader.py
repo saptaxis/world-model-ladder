@@ -1,6 +1,6 @@
 """Episode dataset for world model training.
 
-Loads .npz episodes from a directory. Two modes:
+Loads .npz episodes from one or more directories. Two modes:
   - "single_step": yields (state, action, delta) tuples for feedforward training
   - "sequence": yields (state_seq, action_seq) windows for multi-step/recurrent training
 """
@@ -15,10 +15,11 @@ from torch.utils.data import Dataset
 
 
 class EpisodeDataset(Dataset):
-    """Load episodes from a directory of .npz files.
+    """Load episodes from one or more directories of .npz files.
 
     Args:
-        data_path: directory containing .npz episode files
+        data_path: directory or list of directories containing .npz episode files.
+            When a list, episodes from all directories are combined.
         state_dim: number of state dimensions to use (8 = kinematic only, 15 = full)
         mode: "single_step" or "sequence"
         seq_len: sequence length for "sequence" mode
@@ -26,11 +27,13 @@ class EpisodeDataset(Dataset):
         val_fraction: fraction of episodes reserved for validation
         seed: seed for deterministic train/val split
         subsample: take every Nth frame (1 = no subsampling, 5 = 10 FPS from 50 FPS)
+        max_episodes_per_path: optional cap on episodes loaded from each path.
+            None means load all. Useful for balancing sources in a multi-path mix.
     """
 
     def __init__(
         self,
-        data_path: str | Path,
+        data_path: str | Path | list[str | Path],
         state_dim: int = 8,
         mode: str = "single_step",
         seq_len: int | None = None,
@@ -38,6 +41,7 @@ class EpisodeDataset(Dataset):
         val_fraction: float = 0.1,
         seed: int = 0,
         subsample: int = 1,
+        max_episodes_per_path: int | None = None,
     ):
         self.state_dim = state_dim
         self.action_dim = 2
@@ -45,10 +49,25 @@ class EpisodeDataset(Dataset):
         self.seq_len = seq_len
         self.subsample = subsample
 
-        # Load all .npz files sorted for deterministic ordering
-        npz_paths = sorted(Path(data_path).glob("**/*.npz"))
+        # Normalize data_path to list
+        if isinstance(data_path, (str, Path)):
+            data_path = [data_path]
+
+        # Collect .npz files from all paths, sorted within each for determinism
+        npz_paths = []
+        for dp in data_path:
+            dp_files = sorted(Path(dp).glob("**/*.npz"))
+            if not dp_files:
+                raise FileNotFoundError(f"No .npz files in {dp}")
+            if max_episodes_per_path is not None and len(dp_files) > max_episodes_per_path:
+                # Deterministic subsample using seed
+                rng = np.random.default_rng(seed)
+                idx = rng.choice(len(dp_files), max_episodes_per_path, replace=False)
+                dp_files = [dp_files[int(i)] for i in sorted(idx)]
+            npz_paths.extend(dp_files)
+
         if not npz_paths:
-            raise FileNotFoundError(f"No .npz files in {data_path}")
+            raise FileNotFoundError(f"No .npz files found in any of {data_path}")
 
         # Train/val split by file index
         if split is not None:
@@ -137,16 +156,20 @@ class EpisodeDataset(Dataset):
         ]
 
 
-def detect_dims(data_path: str | Path) -> tuple[int, int]:
+def detect_dims(data_path: str | Path | list[str | Path]) -> tuple[int, int]:
     """Auto-detect state_dim and action_dim from the first .npz file.
 
     Args:
-        data_path: directory containing .npz episode files
+        data_path: directory or list of directories containing .npz episode files
 
     Returns:
         (state_dim, action_dim) tuple
     """
-    npz_paths = sorted(Path(data_path).glob("**/*.npz"))
+    if isinstance(data_path, (str, Path)):
+        data_path = [data_path]
+    npz_paths = []
+    for dp in data_path:
+        npz_paths.extend(sorted(Path(dp).glob("**/*.npz")))
     if not npz_paths:
         raise FileNotFoundError(f"No .npz files in {data_path}")
 
