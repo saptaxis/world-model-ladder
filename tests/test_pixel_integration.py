@@ -58,3 +58,46 @@ class TestPixelWorldModel:
         actions = torch.randn(1, 3, 2)
         frames = model.dream(seed, actions)
         assert frames.shape == (1, 4, 4, 84, 84)
+
+
+class TestPixelSmokeTest:
+    """Smoke test with a real Lunar Lander episode."""
+
+    def test_vae_on_real_frame(self):
+        """VAE can encode and decode a real Lunar Lander frame."""
+        import numpy as np
+        episode_path = "/media/hdd1/physics-priors-latent-space/lunar-lander-data/encoder-pretrain/random/episode_00000.npz"
+        data = np.load(episode_path)
+        frame = data["rgb_frames"][0]  # (400, 600, 3)
+
+        import cv2
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+        tensor = torch.from_numpy(resized).float().unsqueeze(0).unsqueeze(0) / 255.0
+
+        vae = PixelVAE(in_channels=1, latent_dim=64, frame_size=84)
+        recon, mu, logvar = vae(tensor)
+        assert recon.shape == (1, 1, 84, 84)
+        assert 0 <= recon.min() and recon.max() <= 1
+
+    def test_dream_on_real_episode(self):
+        """Dream 10 steps from a real episode seed."""
+        import numpy as np
+        import cv2
+        episode_path = "/media/hdd1/physics-priors-latent-space/lunar-lander-data/encoder-pretrain/random/episode_00000.npz"
+        data = np.load(episode_path)
+        frame = data["rgb_frames"][0]
+        actions = data["actions"][:10]
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+        seed = torch.from_numpy(resized).float().unsqueeze(0).unsqueeze(0) / 255.0
+        act_tensor = torch.from_numpy(actions).float().unsqueeze(0)
+
+        vae = PixelVAE(in_channels=1, latent_dim=32, frame_size=84,
+                       channels=[16, 32, 64, 128])
+        dynamics = LatentDynamicsModel(latent_dim=32, action_dim=2, hidden_size=64)
+        model = PixelWorldModel(vae, dynamics)
+
+        frames = model.dream(seed, act_tensor)
+        assert frames.shape == (1, 11, 1, 84, 84)
