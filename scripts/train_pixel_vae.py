@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Train a PixelVAE (Phase 1 of pixel world model).
+
+Usage:
+    python scripts/train_pixel_vae.py \
+        --data-path /path/to/episodes \
+        --run-dir runs/pixel-vae \
+        --epochs 50 --batch-size 128
+"""
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+from pathlib import Path
+
+import torch
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+from data.pixel_dataset import PixelFrameDataset
+from models.pixel_vae import PixelVAE
+from training.callbacks import (
+    CallbackContext,
+    CheckpointCallback,
+    GradNormCallback,
+    NaNDetectionCallback,
+    ProgressCallback,
+)
+from training.pixel_callbacks import PixelVAEValidationCallback, ReconGridCallback
+from training.pixel_loop import pixel_vae_train_epoch
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train PixelVAE")
+    p.add_argument("--data-path", type=str, required=True)
+    p.add_argument("--run-dir", type=str, default="runs/pixel-vae")
+    p.add_argument("--frame-size", type=int, default=84)
+    p.add_argument("--latent-dim", type=int, default=64)
+    p.add_argument("--in-channels", type=int, default=1)
+    p.add_argument("--channels", type=int, nargs="+", default=[32, 64, 128, 256])
+    p.add_argument("--beta", type=float, default=0.0001)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--val-every", type=int, default=500)
+    p.add_argument("--patience", type=int, default=10)
+    p.add_argument("--ckpt-every", type=int, default=2000)
+    p.add_argument("--device", type=str,
+                   default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--grayscale", action="store_true", default=True)
+    p.add_argument("--no-grayscale", dest="grayscale", action="store_false")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Directories
+    vae_dir = Path(args.run_dir) / "vae"
+    vae_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = str(vae_dir)
+
+    # Data
+    print(f"Loading data from {args.data_path} ...")
+    train_ds = PixelFrameDataset(
+        args.data_path, frame_size=args.frame_size,
+        grayscale=args.grayscale, split="train",
+    )
+    val_ds = PixelFrameDataset(
+        args.data_path, frame_size=args.frame_size,
+        grayscale=args.grayscale, split="val",
+    )
+    print(f"  Train: {len(train_ds)} frames, Val: {len(val_ds)} frames")
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
+
+    # Model
+    grayscale_channels = 1 if args.grayscale else 3
+    in_ch = args.in_channels if args.in_channels != 1 else grayscale_channels
+    vae = PixelVAE(
+        in_channels=in_ch,
+        latent_dim=args.latent_dim,
+        frame_size=args.frame_size,
+        channels=args.channels,
+        beta=args.beta,
+    ).to(args.device)
+
+    param_count = sum(p.numel() for p in vae.parameters())
+    print(f"PixelVAE: {param_count:,} parameters")
+
+    optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
+
+    # TensorBoard
+    writer = SummaryWriter(log_dir=str(vae_dir / "tb"))
+
+    # Config dict for checkpoint saving
+    config = {
+        "in_channels": in_ch,
+        "latent_dim": args.latent_dim,
+        "frame_size": args.frame_size,
+        "channels": args.channels,
+        "beta": args.beta,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+    }
+
+    # Callbacks
+    # Get a sample batch for ReconGridCallback
+    sample_batch = next(iter(val_loader))
+    if isinstance(sample_batch, (list, tuple)):
+        sample_batch = sample_batch[0]
+
+    callbacks = [
+        PixelVAEValidationCallback(
+            val_loader=val_loader, beta=args.beta,
+            every_n_steps=args.val_every, patience=args.patience,
+            checkpoint_dir=ckpt_dir,
+        ),
+        CheckpointCallback(checkpoint_dir=ckpt_dir, every_n_steps=args.ckpt_every),
+        ReconGridCallback(sample_batch=sample_batch, every_n_steps=args.val_every),
+        GradNormCallback(every_n_steps=50),
+        NaNDetectionCallback(),
+        ProgressCallback(every_n_steps=100, total_epochs=args.epochs),
+    ]
+
+    ctx = CallbackContext(
+        model=vae, optimizer=optimizer, writer=writer,
+        global_step=0, epoch=0, run_dir=str(vae_dir),
+        device=args.device,
+        extras={"config": config},
+    )
+
+    # SIGINT handler
+    interrupted = False
+
+    def handle_sigint(sig, frame):
+        nonlocal interrupted
+        if interrupted:
+            sys.exit(1)
+        interrupted = True
+        print("\nInterrupted! Saving checkpoint and exiting...")
+        torch.save({
+            "model_state_dict": vae.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": ctx.epoch,
+            "global_step": ctx.global_step,
+            "config": config,
+        }, Path(ckpt_dir) / "interrupted.pt")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    # Train
+    for cb in callbacks:
+        cb.on_train_start(ctx)
+
+    print(f"\nTraining VAE for {args.epochs} epochs on {args.device}")
+    for epoch in range(args.epochs):
+        ctx.epoch = epoch
+        result = pixel_vae_train_epoch(
+            vae, train_loader, optimizer,
+            beta=args.beta, device=args.device,
+            max_grad_norm=args.grad_clip,
+            ctx=ctx, callbacks=callbacks,
+        )
+
+        print(f"Epoch {epoch}: train_loss={result['train_loss']:.6f} "
+              f"recon={result['recon_loss']:.6f} kl={result['kl_loss']:.6f}")
+
+        for cb in callbacks:
+            if cb.on_epoch_end(ctx) is False:
+                print("Early stopping triggered.")
+                break
+
+        if result.get("stop_requested"):
+            print("Stop requested by callback.")
+            break
+
+    for cb in callbacks:
+        cb.on_train_end(ctx)
+
+    writer.close()
+    print(f"\nVAE training complete. Best checkpoint: {ckpt_dir}/best.pt")
+
+
+if __name__ == "__main__":
+    main()
