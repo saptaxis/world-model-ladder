@@ -49,7 +49,10 @@ def parse_args():
     p.add_argument("--ckpt-every", type=int, default=2000)
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=4,
+                   help="DataLoader workers for batch prefetching")
+    p.add_argument("--load-workers", type=int, default=8,
+                   help="Parallel workers for initial npz loading")
     p.add_argument("--grayscale", action="store_true", default=True)
     p.add_argument("--no-grayscale", dest="grayscale", action="store_false")
     return p.parse_args()
@@ -68,10 +71,12 @@ def main():
     train_ds = PixelFrameDataset(
         args.data_path, frame_size=args.frame_size,
         grayscale=args.grayscale, split="train",
+        n_workers=args.load_workers,
     )
     val_ds = PixelFrameDataset(
         args.data_path, frame_size=args.frame_size,
         grayscale=args.grayscale, split="val",
+        n_workers=args.load_workers,
     )
     print(f"  Train: {len(train_ds)} frames, Val: {len(val_ds)} frames")
 

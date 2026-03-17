@@ -83,7 +83,10 @@ def parse_args():
     p.add_argument("--sampling-warmup-frac", type=float, default=0.5)
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=4,
+                   help="DataLoader workers for batch prefetching")
+    p.add_argument("--load-workers", type=int, default=8,
+                   help="Parallel workers for initial npz loading")
     return p.parse_args()
 
 
@@ -110,10 +113,12 @@ def main():
     train_ds = PixelEpisodeDataset(
         args.data_path, frame_size=frame_size, grayscale=grayscale,
         seq_len=args.seq_len, frame_stack=args.frame_stack, split="train",
+        n_workers=args.load_workers,
     )
     val_ds = PixelEpisodeDataset(
         args.data_path, frame_size=frame_size, grayscale=grayscale,
         seq_len=args.seq_len, frame_stack=args.frame_stack, split="val",
+        n_workers=args.load_workers,
     )
     print(f"  Train: {len(train_ds)} windows, Val: {len(val_ds)} windows")
 
