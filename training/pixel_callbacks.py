@@ -24,12 +24,13 @@ class PixelVAEValidationCallback(TrainCallback):
     """VAE validation with early stopping and best-checkpoint saving."""
 
     def __init__(self, val_loader, beta: float = 0.0001,
-                 fg_weight: float = 1.0,
+                 fg_weight: float = 1.0, state_weight: float = 0.0,
                  every_n_steps: int = 500, patience: int = 10,
                  checkpoint_dir: str | None = None):
         self.val_loader = val_loader
         self.beta = beta
         self.fg_weight = fg_weight
+        self.state_weight = state_weight
         self.every_n_steps = every_n_steps
         self.patience = patience
         self.checkpoint_dir = checkpoint_dir
@@ -54,16 +55,26 @@ class PixelVAEValidationCallback(TrainCallback):
         total_loss = 0.0
         total_recon = 0.0
         total_kl = 0.0
+        total_state = 0.0
         n = 0
         with torch.no_grad():
             for batch in self.val_loader:
-                x = batch.to(ctx.device) if isinstance(batch, torch.Tensor) else batch[0].to(ctx.device)
-                recon, mu, logvar = ctx.model(x)
-                loss, recon_l, kl_l = vae_loss(recon, x, mu, logvar, self.beta,
-                                               fg_weight=self.fg_weight)
+                if isinstance(batch, torch.Tensor):
+                    x = batch.to(ctx.device)
+                    state_target = None
+                else:
+                    x = batch[0].to(ctx.device)
+                    state_target = batch[1].to(ctx.device) if len(batch) > 1 else None
+                recon, mu, logvar, state_pred = ctx.model(x)
+                loss, recon_l, kl_l, state_l = vae_loss(
+                    recon, x, mu, logvar, self.beta,
+                    fg_weight=self.fg_weight,
+                    state_pred=state_pred, state_target=state_target,
+                    state_weight=self.state_weight)
                 total_loss += loss.item()
                 total_recon += recon_l.item()
                 total_kl += kl_l.item()
+                total_state += state_l.item()
                 n += 1
         ctx.model.train()
 
@@ -74,6 +85,8 @@ class PixelVAEValidationCallback(TrainCallback):
             ctx.writer.add_scalar("val/loss", val_loss, ctx.global_step)
             ctx.writer.add_scalar("val/recon_loss", total_recon / max(n, 1), ctx.global_step)
             ctx.writer.add_scalar("val/kl_loss", total_kl / max(n, 1), ctx.global_step)
+            if self.state_weight > 0:
+                ctx.writer.add_scalar("val/state_loss", total_state / max(n, 1), ctx.global_step)
 
         if val_loss < self.best_val_loss:
             self.best_val_loss = val_loss
@@ -114,7 +127,7 @@ class ReconGridCallback(TrainCallback):
         ctx.model.eval()
         with torch.no_grad():
             x = self.sample_batch.to(ctx.device)
-            recon, _, _ = ctx.model(x)
+            recon, _, _, _ = ctx.model(x)
             pairs = torch.stack([x, recon], dim=1).reshape(-1, *x.shape[1:])
             try:
                 from torchvision.utils import make_grid

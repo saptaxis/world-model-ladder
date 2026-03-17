@@ -27,7 +27,7 @@ class TestPixelVAE:
         """Forward pass returns reconstruction, mu, logvar."""
         vae = PixelVAE(in_channels=1, latent_dim=64, frame_size=84)
         x = torch.randn(2, 1, 84, 84)
-        recon, mu, logvar = vae(x)
+        recon, mu, logvar, _ = vae(x)
         assert recon.shape == x.shape
         assert mu.shape == (2, 64)
         assert logvar.shape == (2, 64)
@@ -47,14 +47,14 @@ class TestPixelVAE:
         """VAE works with 4-channel (stacked frames) input."""
         vae = PixelVAE(in_channels=4, latent_dim=64, frame_size=84)
         x = torch.randn(2, 4, 84, 84)
-        recon, mu, logvar = vae(x)
+        recon, mu, logvar, _ = vae(x)
         assert recon.shape == (2, 4, 84, 84)
 
     def test_128_resolution(self):
         """VAE works at 128x128 resolution."""
         vae = PixelVAE(in_channels=1, latent_dim=64, frame_size=128)
         x = torch.randn(2, 1, 128, 128)
-        recon, mu, logvar = vae(x)
+        recon, mu, logvar, _ = vae(x)
         assert recon.shape == (2, 1, 128, 128)
 
     def test_custom_channels(self):
@@ -62,7 +62,7 @@ class TestPixelVAE:
         vae = PixelVAE(in_channels=1, latent_dim=32,
                        frame_size=84, channels=[16, 32, 64, 128])
         x = torch.randn(2, 1, 84, 84)
-        recon, mu, logvar = vae(x)
+        recon, mu, logvar, _ = vae(x)
         assert recon.shape == x.shape
         assert mu.shape == (2, 32)
 
@@ -71,6 +71,6 @@ class TestPixelVAE:
         vae = PixelVAE(in_channels=1, latent_dim=64, frame_size=84)
         vae.eval()
         x = torch.randn(2, 1, 84, 84).clamp(0, 1)
-        recon, _, _ = vae(x)
+        recon, _, _, _ = vae(x)
         assert recon.min() >= 0.0
         assert recon.max() <= 1.0

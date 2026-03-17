@@ -69,6 +69,23 @@ def _load_one_episode(args: tuple) -> np.ndarray | None:
         return None
 
 
+def _load_one_episode_states(args: tuple) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Load frames + states from a single episode. For multiprocessing.Pool."""
+    path, frame_size, grayscale, state_dim = args
+    try:
+        with np.load(str(path)) as data:
+            raw_frames = data["rgb_frames"]
+            # States are (T+1, full_state_dim), slice to state_dim
+            states = data["states"][:, :state_dim].astype(np.float32) if "states" in data else None
+        processed = np.stack([
+            _preprocess_frame(raw_frames[i], frame_size, grayscale)
+            for i in range(len(raw_frames))
+        ])
+        return processed, states
+    except Exception:
+        return None, None
+
+
 def _load_one_episode_with_actions(args: tuple) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Load and preprocess a single episode's frames + actions. For multiprocessing.Pool."""
     path, frame_size, grayscale = args
@@ -122,6 +139,9 @@ class PixelFrameDataset(Dataset):
     single .npy file for instant loading on subsequent runs (~2s vs ~10min).
     Cache is per-split: include the split name in cache_path.
 
+    When state_dim > 0, also loads kinematic states and returns
+    (frame, state) tuples instead of just frames.
+
     Args:
         data_path: directory with .npz episode files
         frame_size: target resolution (square)
@@ -130,21 +150,33 @@ class PixelFrameDataset(Dataset):
         val_fraction: fraction for validation
         seed: RNG seed for split
         cache_path: optional path to save/load preprocessed frames (.npy)
+        state_dim: if > 0, load and return states (first N dims from .npz states)
     """
 
     def __init__(self, data_path: str | Path, frame_size: int = 84,
                  grayscale: bool = True, split: str | None = None,
                  val_fraction: float = 0.1, seed: int = 0,
-                 n_workers: int = 8, cache_path: str | Path | None = None):
+                 n_workers: int = 8, cache_path: str | Path | None = None,
+                 state_dim: int = 0):
         self.frame_size = frame_size
         self.grayscale = grayscale
+        self.state_dim = state_dim
+        self._states = None  # (N, state_dim) float32 or None
 
         # Try loading from cache first
         if cache_path is not None and Path(cache_path).exists():
             print(f"Loading cached frames from {cache_path} ...")
             self._frames = np.load(str(cache_path))
-            mb = self._frames.nbytes / 1024 / 1024
-            print(f"PixelFrameDataset: {self._frames.shape[0]} frames ({mb:.0f} MB, from cache)")
+            # Check for states cache alongside
+            states_cache = str(cache_path).replace(".npy", "_states.npy")
+            if state_dim > 0 and Path(states_cache).exists():
+                self._states = np.load(states_cache)
+                print(f"PixelFrameDataset: {self._frames.shape[0]} frames + states ({self._states.shape[1]}D, from cache)")
+            else:
+                mb = self._frames.nbytes / 1024 / 1024
+                print(f"PixelFrameDataset: {self._frames.shape[0]} frames ({mb:.0f} MB, from cache)")
+                if state_dim > 0:
+                    print(f"  WARNING: state_dim={state_dim} requested but no states cache found. States unavailable.")
             return
 
         data_path = Path(data_path)
@@ -152,35 +184,66 @@ class PixelFrameDataset(Dataset):
         npz_files = [f for f in npz_files if "prepared" not in f.name]
         episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
-        # Pre-load all frames into one flat array (parallel)
-        episodes = _load_and_preprocess_all_frames(
-            episode_files, frame_size, grayscale, n_workers=n_workers)
+        if state_dim > 0:
+            # Load frames + states in parallel
+            from multiprocessing import Pool
+            args = [(path, frame_size, grayscale, state_dim) for path in episode_files]
+            all_frames = []
+            all_states = []
+            with Pool(n_workers) as pool:
+                for frames, states in tqdm(
+                    pool.imap(_load_one_episode_states, args),
+                    total=len(args), desc="Loading frames+states", unit="ep",
+                ):
+                    if frames is not None:
+                        all_frames.append(frames)
+                        if states is not None:
+                            all_states.append(states)
 
-        if episodes:
-            # Concatenate all frames into single array
-            self._frames = np.concatenate(episodes, axis=0)  # (N, H, W) or (N, H, W, 3)
-        else:
-            if grayscale:
-                self._frames = np.zeros((0, frame_size, frame_size), dtype=np.uint8)
+            if all_frames:
+                self._frames = np.concatenate(all_frames, axis=0)
+                if all_states:
+                    self._states = np.concatenate(all_states, axis=0).astype(np.float32)
             else:
-                self._frames = np.zeros((0, frame_size, frame_size, 3), dtype=np.uint8)
+                self._frames = np.zeros((0, frame_size, frame_size), dtype=np.uint8)
+        else:
+            # Frames only (original path)
+            episodes = _load_and_preprocess_all_frames(
+                episode_files, frame_size, grayscale, n_workers=n_workers)
+            if episodes:
+                self._frames = np.concatenate(episodes, axis=0)
+            else:
+                if grayscale:
+                    self._frames = np.zeros((0, frame_size, frame_size), dtype=np.uint8)
+                else:
+                    self._frames = np.zeros((0, frame_size, frame_size, 3), dtype=np.uint8)
 
         n_total = self._frames.shape[0]
         mb = self._frames.nbytes / 1024 / 1024
-        print(f"PixelFrameDataset: {n_total} frames from {len(episodes)} episodes "
-              f"({mb:.0f} MB in RAM)")
+        if self._states is not None:
+            mb += self._states.nbytes / 1024 / 1024
+        print(f"PixelFrameDataset: {n_total} frames"
+              f"{f' + {self.state_dim}D states' if self._states is not None else ''}"
+              f" from {len(episode_files)} episodes ({mb:.0f} MB in RAM)")
 
-        # Save cache for instant loading next time
+        # Save cache
         if cache_path is not None and n_total > 0:
             Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
             np.save(str(cache_path), self._frames)
+            if self._states is not None:
+                states_cache = str(cache_path).replace(".npy", "_states.npy")
+                np.save(states_cache, self._states)
             print(f"Saved frame cache to {cache_path}")
 
     def __len__(self) -> int:
         return self._frames.shape[0]
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        return _frame_to_tensor(self._frames[idx])
+    def __getitem__(self, idx: int) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        frame = _frame_to_tensor(self._frames[idx])
+        if self._states is not None:
+            state = torch.from_numpy(self._states[idx]).float()
+            return frame, state
+        return frame
 
 
 class PixelEpisodeDataset(Dataset):

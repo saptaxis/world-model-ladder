@@ -42,6 +42,10 @@ def parse_args():
     p.add_argument("--beta", type=float, default=0.0001)
     p.add_argument("--fg-weight", type=float, default=1.0,
                    help="Foreground pixel weight in recon loss. >1 upweights lander/flames vs sky/terrain.")
+    p.add_argument("--state-dim", type=int, default=0,
+                   help="Aux state prediction head dim. 6 = (x,y,vx,vy,angle,ang_vel). 0 = disabled.")
+    p.add_argument("--state-weight", type=float, default=1.0,
+                   help="Weight for auxiliary state prediction loss (only if --state-dim > 0).")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--epochs", type=int, default=50)
@@ -84,11 +88,13 @@ def main():
         args.data_path, frame_size=args.frame_size,
         grayscale=args.grayscale, split="train",
         n_workers=args.load_workers, cache_path=cache_train,
+        state_dim=args.state_dim,
     )
     val_ds = PixelFrameDataset(
         args.data_path, frame_size=args.frame_size,
         grayscale=args.grayscale, split="val",
         n_workers=args.load_workers, cache_path=cache_val,
+        state_dim=args.state_dim,
     )
     print(f"  Train: {len(train_ds)} frames, Val: {len(val_ds)} frames")
 
@@ -106,6 +112,7 @@ def main():
         frame_size=args.frame_size,
         channels=args.channels,
         beta=args.beta,
+        state_dim=args.state_dim,
     ).to(args.device)
 
     param_count = sum(p.numel() for p in vae.parameters())
@@ -124,6 +131,8 @@ def main():
         "channels": args.channels,
         "beta": args.beta,
         "fg_weight": args.fg_weight,
+        "state_dim": args.state_dim,
+        "state_weight": args.state_weight,
         "lr": args.lr,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
@@ -146,6 +155,7 @@ def main():
         PixelVAEValidationCallback(
             val_loader=val_loader, beta=args.beta,
             fg_weight=args.fg_weight,
+            state_weight=args.state_weight if args.state_dim > 0 else 0.0,
             every_n_steps=args.val_every, patience=args.patience,
             checkpoint_dir=ckpt_dir,
         ),
@@ -193,13 +203,15 @@ def main():
         result = pixel_vae_train_epoch(
             vae, train_loader, optimizer,
             beta=args.beta, fg_weight=args.fg_weight,
+            state_weight=args.state_weight if args.state_dim > 0 else 0.0,
             device=args.device,
             max_grad_norm=args.grad_clip,
             ctx=ctx, callbacks=callbacks,
         )
 
+        state_str = f" state={result['state_loss']:.6f}" if args.state_dim > 0 else ""
         print(f"Epoch {epoch}: train_loss={result['train_loss']:.6f} "
-              f"recon={result['recon_loss']:.6f} kl={result['kl_loss']:.6f}")
+              f"recon={result['recon_loss']:.6f} kl={result['kl_loss']:.6f}{state_str}")
 
         for cb in callbacks:
             if cb.on_epoch_end(ctx) is False:

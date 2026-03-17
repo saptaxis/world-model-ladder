@@ -26,6 +26,9 @@ class PixelVAE(nn.Module):
         frame_size: spatial resolution (84 or 128)
         channels: list of channel sizes for conv layers
         beta: KL divergence weight (used externally in loss, stored for reference)
+        state_dim: if > 0, add auxiliary state prediction head (z → kinematic state).
+            Forces latent space to encode physical state, giving z spatial/physical
+            meaning. 6 = (x, y, vx, vy, angle, ang_vel).
     """
 
     def __init__(
@@ -35,6 +38,7 @@ class PixelVAE(nn.Module):
         frame_size: int = 84,
         channels: list[int] | None = None,
         beta: float = 0.0001,
+        state_dim: int = 0,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -100,6 +104,23 @@ class PixelVAE(nn.Module):
         ))
         self.decoder_layers = dec_layers
 
+        # Optional auxiliary state prediction head
+        self.state_dim = state_dim
+        if state_dim > 0:
+            self.state_head = nn.Sequential(
+                nn.Linear(latent_dim, 64),
+                nn.ReLU(inplace=True),
+                nn.Linear(64, state_dim),
+            )
+        else:
+            self.state_head = None
+
+    def predict_state(self, z: torch.Tensor) -> torch.Tensor | None:
+        """Predict kinematic state from latent z. Returns None if no state head."""
+        if self.state_head is None:
+            return None
+        return self.state_head(z)
+
     def encode_params(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode frames to (mu, logvar) parameters."""
         h = self.encoder_conv(x)
@@ -127,9 +148,17 @@ class PixelVAE(nn.Module):
             h = layer(h)
         return h
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Full forward pass: encode, sample, decode."""
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Full forward pass: encode, sample, decode, optionally predict state.
+
+        Returns:
+            recon: (B, C, H, W) reconstruction
+            mu: (B, latent_dim)
+            logvar: (B, latent_dim)
+            state_pred: (B, state_dim) or None if no state head
+        """
         mu, logvar = self.encode_params(x)
         z = self.reparameterize(mu, logvar)
         recon = self.decode(z)
-        return recon, mu, logvar
+        state_pred = self.predict_state(z)
+        return recon, mu, logvar, state_pred

@@ -76,7 +76,7 @@ class TestPixelSmokeTest:
         tensor = torch.from_numpy(resized).float().unsqueeze(0).unsqueeze(0) / 255.0
 
         vae = PixelVAE(in_channels=1, latent_dim=64, frame_size=84)
-        recon, mu, logvar = vae(tensor)
+        recon, mu, logvar, _ = vae(tensor)
         assert recon.shape == (1, 1, 84, 84)
         assert 0 <= recon.min() and recon.max() <= 1
 

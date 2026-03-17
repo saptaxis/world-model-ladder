@@ -16,7 +16,7 @@ from training.pixel_losses import vae_loss, latent_dynamics_loss
 
 
 def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
-                          fg_weight: float = 1.0,
+                          fg_weight: float = 1.0, state_weight: float = 0.0,
                           device: str = "cpu", max_grad_norm: float = 1.0,
                           ctx=None, callbacks=None) -> dict:
     """One VAE training epoch with callback dispatch."""
@@ -24,6 +24,7 @@ def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
     total_loss = 0.0
     total_recon = 0.0
     total_kl = 0.0
+    total_state = 0.0
     n_batches = 0
     stop_requested = False
 
@@ -31,10 +32,19 @@ def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
         if ctx is not None:
             ctx.global_step += 1
 
-        x = batch.to(device) if isinstance(batch, torch.Tensor) else batch[0].to(device)
-        recon, mu, logvar = model(x)
-        loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar, beta,
-                                             fg_weight=fg_weight)
+        # batch is either a tensor (frames only) or tuple (frames, states)
+        if isinstance(batch, torch.Tensor):
+            x = batch.to(device)
+            state_target = None
+        else:
+            x = batch[0].to(device)
+            state_target = batch[1].to(device) if len(batch) > 1 else None
+
+        recon, mu, logvar, state_pred = model(x)
+        loss, recon_loss, kl_loss, state_loss = vae_loss(
+            recon, x, mu, logvar, beta, fg_weight=fg_weight,
+            state_pred=state_pred, state_target=state_target,
+            state_weight=state_weight)
 
         optimizer.zero_grad()
         loss.backward()
@@ -44,10 +54,13 @@ def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
             ctx.extras["train_loss_step"] = loss.item()
             ctx.extras["recon_loss_step"] = recon_loss.item()
             ctx.extras["kl_loss_step"] = kl_loss.item()
+            ctx.extras["state_loss_step"] = state_loss.item()
             if ctx.writer:
                 ctx.writer.add_scalar("train/loss", loss.item(), ctx.global_step)
                 ctx.writer.add_scalar("train/recon_loss", recon_loss.item(), ctx.global_step)
                 ctx.writer.add_scalar("train/kl_loss", kl_loss.item(), ctx.global_step)
+                if state_weight > 0:
+                    ctx.writer.add_scalar("train/state_loss", state_loss.item(), ctx.global_step)
             for cb in callbacks:
                 if cb.on_step(ctx) is False:
                     stop_requested = True
@@ -58,6 +71,7 @@ def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
         total_loss += loss.item()
         total_recon += recon_loss.item()
         total_kl += kl_loss.item()
+        total_state += state_loss.item()
         n_batches += 1
 
         if stop_requested:
@@ -67,6 +81,7 @@ def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
         "train_loss": total_loss / max(n_batches, 1),
         "recon_loss": total_recon / max(n_batches, 1),
         "kl_loss": total_kl / max(n_batches, 1),
+        "state_loss": total_state / max(n_batches, 1),
         "stop_requested": stop_requested,
     }
 
