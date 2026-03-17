@@ -80,8 +80,9 @@ def main():
     if args.cache_dir:
         cache_dir = Path(args.cache_dir)
         gs_tag = "gray" if args.grayscale else "rgb"
-        cache_train = cache_dir / f"frames_train_{args.frame_size}_{gs_tag}.npy"
-        cache_val = cache_dir / f"frames_val_{args.frame_size}_{gs_tag}.npy"
+        state_tag = f"_s{args.state_dim}" if args.state_dim > 0 else ""
+        cache_train = cache_dir / f"frames_train_{args.frame_size}_{gs_tag}{state_tag}.npz"
+        cache_val = cache_dir / f"frames_val_{args.frame_size}_{gs_tag}{state_tag}.npz"
 
     print(f"Loading data from {args.data_path} ...")
     train_ds = PixelFrameDataset(
