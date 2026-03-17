@@ -202,46 +202,72 @@ class PixelEpisodeDataset(Dataset):
                  grayscale: bool = True, seq_len: int = 20,
                  frame_stack: int = 1, split: str | None = None,
                  val_fraction: float = 0.1, seed: int = 0,
-                 n_workers: int = 8):
+                 n_workers: int = 8, cache_path: str | Path | None = None):
         self.frame_size = frame_size
         self.grayscale = grayscale
         self.seq_len = seq_len
         self.frame_stack = frame_stack
 
-        data_path = Path(data_path)
-        npz_files = sorted(data_path.glob("**/*.npz"))
-        npz_files = [f for f in npz_files if "prepared" not in f.name]
-        episode_files = _split_episodes(npz_files, split, val_fraction, seed)
-
         min_frames = seq_len + frame_stack - 1 + 1
 
-        # Pre-load frames and actions per episode in parallel, build window index
+        # Pre-load frames and actions per episode, build window index
         self._episode_frames = []  # list of (T+1, H, W) uint8 arrays
         self._episode_actions = []  # list of (T, action_dim) float32 arrays
         self._window_index = []  # (episode_idx, start_frame)
 
-        from multiprocessing import Pool
-
-        args = [(path, frame_size, grayscale) for path in episode_files]
-        with Pool(n_workers) as pool:
-            for frames, actions in tqdm(
-                pool.imap(_load_one_episode_with_actions, args),
-                total=len(args), desc="Loading episodes", unit="ep",
-            ):
-                if frames is None:
+        # Try cache first
+        if cache_path is not None and Path(cache_path).exists():
+            print(f"Loading cached episodes from {cache_path} ...")
+            cached = np.load(str(cache_path), allow_pickle=True)
+            all_frames = cached["all_frames"]  # object array of per-episode frames
+            all_actions = cached["all_actions"]  # object array of per-episode actions
+            for i in range(len(all_frames)):
+                frames = all_frames[i]
+                if frames.shape[0] < min_frames:
                     continue
-                usable = frames.shape[0]
-                if usable < min_frames:
-                    continue
-
                 ep_idx = len(self._episode_frames)
                 self._episode_frames.append(frames)
-                self._episode_actions.append(actions)
-
-                # Build window indices
-                max_start = usable - seq_len - frame_stack + 1
+                self._episode_actions.append(all_actions[i])
+                max_start = frames.shape[0] - seq_len - frame_stack + 1
                 for s in range(frame_stack - 1, frame_stack - 1 + max_start):
                     self._window_index.append((ep_idx, s))
+        else:
+            data_path = Path(data_path)
+            npz_files = sorted(data_path.glob("**/*.npz"))
+            npz_files = [f for f in npz_files if "prepared" not in f.name]
+            episode_files = _split_episodes(npz_files, split, val_fraction, seed)
+
+            from multiprocessing import Pool
+
+            args = [(path, frame_size, grayscale) for path in episode_files]
+            with Pool(n_workers) as pool:
+                for frames, actions in tqdm(
+                    pool.imap(_load_one_episode_with_actions, args),
+                    total=len(args), desc="Loading episodes", unit="ep",
+                ):
+                    if frames is None:
+                        continue
+                    if frames.shape[0] < min_frames:
+                        continue
+
+                    ep_idx = len(self._episode_frames)
+                    self._episode_frames.append(frames)
+                    self._episode_actions.append(actions)
+
+                    max_start = frames.shape[0] - seq_len - frame_stack + 1
+                    for s in range(frame_stack - 1, frame_stack - 1 + max_start):
+                        self._window_index.append((ep_idx, s))
+
+            # Save cache
+            if cache_path is not None and self._episode_frames:
+                Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+                # Use object arrays to store variable-length episodes
+                np.savez(
+                    str(cache_path),
+                    all_frames=np.array(self._episode_frames, dtype=object),
+                    all_actions=np.array(self._episode_actions, dtype=object),
+                )
+                print(f"Saved episode cache to {cache_path}")
 
         total_frames = sum(f.shape[0] for f in self._episode_frames)
         mb = sum(f.nbytes for f in self._episode_frames) / 1024 / 1024

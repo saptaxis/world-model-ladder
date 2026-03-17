@@ -87,6 +87,8 @@ def parse_args():
                    help="DataLoader workers for batch prefetching")
     p.add_argument("--load-workers", type=int, default=8,
                    help="Parallel workers for initial npz loading")
+    p.add_argument("--cache-dir", type=str, default=None,
+                   help="Dir to cache preprocessed episodes. Instant load on reruns.")
     return p.parse_args()
 
 
@@ -110,15 +112,23 @@ def main():
 
     # Data
     print(f"Loading data from {args.data_path} ...")
+    cache_train = None
+    cache_val = None
+    if args.cache_dir:
+        cache_dir = Path(args.cache_dir)
+        gs_tag = "gray" if grayscale else "rgb"
+        cache_train = cache_dir / f"episodes_train_{frame_size}_{gs_tag}.npz"
+        cache_val = cache_dir / f"episodes_val_{frame_size}_{gs_tag}.npz"
+
     train_ds = PixelEpisodeDataset(
         args.data_path, frame_size=frame_size, grayscale=grayscale,
         seq_len=args.seq_len, frame_stack=args.frame_stack, split="train",
-        n_workers=args.load_workers,
+        n_workers=args.load_workers, cache_path=cache_train,
     )
     val_ds = PixelEpisodeDataset(
         args.data_path, frame_size=frame_size, grayscale=grayscale,
         seq_len=args.seq_len, frame_stack=args.frame_stack, split="val",
-        n_workers=args.load_workers,
+        n_workers=args.load_workers, cache_path=cache_val,
     )
     print(f"  Train: {len(train_ds)} windows, Val: {len(val_ds)} windows")
 
