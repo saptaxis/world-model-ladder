@@ -54,23 +54,61 @@ def _split_episodes(npz_files: list[Path], split: str | None,
     return [npz_files[i] for i in selected]
 
 
-def _load_and_preprocess_all_frames(
-    episode_files: list[Path], frame_size: int, grayscale: bool
-) -> list[np.ndarray]:
-    """Load all episodes, preprocess frames, return list of (T+1, H, W) or (T+1, H, W, 3) arrays."""
-    all_episodes = []
-    for path in tqdm(episode_files, desc="Loading frames", unit="ep"):
-        try:
-            with np.load(str(path)) as data:
-                raw_frames = data["rgb_frames"]
-        except Exception:
-            continue
-        # Preprocess each frame in the episode
+def _load_one_episode(args: tuple) -> np.ndarray | None:
+    """Load and preprocess a single episode's frames. For multiprocessing.Pool."""
+    path, frame_size, grayscale = args
+    try:
+        with np.load(str(path)) as data:
+            raw_frames = data["rgb_frames"]
         processed = np.stack([
             _preprocess_frame(raw_frames[i], frame_size, grayscale)
             for i in range(len(raw_frames))
-        ])  # (T+1, H, W) or (T+1, H, W, 3)
-        all_episodes.append(processed)
+        ])
+        return processed
+    except Exception:
+        return None
+
+
+def _load_one_episode_with_actions(args: tuple) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Load and preprocess a single episode's frames + actions. For multiprocessing.Pool."""
+    path, frame_size, grayscale = args
+    try:
+        with np.load(str(path)) as data:
+            raw_frames = data["rgb_frames"]
+            actions = data["actions"].astype(np.float32)
+        n_frames = raw_frames.shape[0]
+        n_actions = actions.shape[0]
+        usable = min(n_frames, n_actions + 1)
+        processed = np.stack([
+            _preprocess_frame(raw_frames[i], frame_size, grayscale)
+            for i in range(usable)
+        ])
+        return processed, actions[:usable - 1]
+    except Exception:
+        return None, None
+
+
+def _load_and_preprocess_all_frames(
+    episode_files: list[Path], frame_size: int, grayscale: bool,
+    n_workers: int = 8,
+) -> list[np.ndarray]:
+    """Load all episodes in parallel, preprocess frames.
+
+    Uses multiprocessing.Pool to parallelize npz decompression + resize.
+    Returns list of (T+1, H, W) or (T+1, H, W, 3) uint8 arrays.
+    """
+    from multiprocessing import Pool
+
+    args = [(path, frame_size, grayscale) for path in episode_files]
+
+    all_episodes = []
+    with Pool(n_workers) as pool:
+        for result in tqdm(
+            pool.imap(_load_one_episode, args),
+            total=len(args), desc="Loading frames", unit="ep",
+        ):
+            if result is not None:
+                all_episodes.append(result)
     return all_episodes
 
 
@@ -91,7 +129,8 @@ class PixelFrameDataset(Dataset):
 
     def __init__(self, data_path: str | Path, frame_size: int = 84,
                  grayscale: bool = True, split: str | None = None,
-                 val_fraction: float = 0.1, seed: int = 0):
+                 val_fraction: float = 0.1, seed: int = 0,
+                 n_workers: int = 8):
         self.frame_size = frame_size
         self.grayscale = grayscale
 
@@ -100,9 +139,9 @@ class PixelFrameDataset(Dataset):
         npz_files = [f for f in npz_files if "prepared" not in f.name]
         episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
-        # Pre-load all frames into one flat array
+        # Pre-load all frames into one flat array (parallel)
         episodes = _load_and_preprocess_all_frames(
-            episode_files, frame_size, grayscale)
+            episode_files, frame_size, grayscale, n_workers=n_workers)
 
         if episodes:
             # Concatenate all frames into single array
@@ -143,7 +182,8 @@ class PixelEpisodeDataset(Dataset):
     def __init__(self, data_path: str | Path, frame_size: int = 84,
                  grayscale: bool = True, seq_len: int = 20,
                  frame_stack: int = 1, split: str | None = None,
-                 val_fraction: float = 0.1, seed: int = 0):
+                 val_fraction: float = 0.1, seed: int = 0,
+                 n_workers: int = 8):
         self.frame_size = frame_size
         self.grayscale = grayscale
         self.seq_len = seq_len
@@ -156,39 +196,33 @@ class PixelEpisodeDataset(Dataset):
 
         min_frames = seq_len + frame_stack - 1 + 1
 
-        # Pre-load frames and actions per episode, build window index
+        # Pre-load frames and actions per episode in parallel, build window index
         self._episode_frames = []  # list of (T+1, H, W) uint8 arrays
         self._episode_actions = []  # list of (T, action_dim) float32 arrays
         self._window_index = []  # (episode_idx, start_frame)
 
-        for path in tqdm(episode_files, desc="Loading episodes", unit="ep"):
-            try:
-                with np.load(str(path)) as data:
-                    raw_frames = data["rgb_frames"]
-                    actions = data["actions"].astype(np.float32)
-            except Exception:
-                continue
+        from multiprocessing import Pool
 
-            n_frames = raw_frames.shape[0]
-            n_actions = actions.shape[0]
-            usable = min(n_frames, n_actions + 1)
-            if usable < min_frames:
-                continue
+        args = [(path, frame_size, grayscale) for path in episode_files]
+        with Pool(n_workers) as pool:
+            for frames, actions in tqdm(
+                pool.imap(_load_one_episode_with_actions, args),
+                total=len(args), desc="Loading episodes", unit="ep",
+            ):
+                if frames is None:
+                    continue
+                usable = frames.shape[0]
+                if usable < min_frames:
+                    continue
 
-            # Preprocess all frames for this episode
-            processed = np.stack([
-                _preprocess_frame(raw_frames[i], frame_size, grayscale)
-                for i in range(usable)
-            ])  # (usable, H, W)
+                ep_idx = len(self._episode_frames)
+                self._episode_frames.append(frames)
+                self._episode_actions.append(actions)
 
-            ep_idx = len(self._episode_frames)
-            self._episode_frames.append(processed)
-            self._episode_actions.append(actions[:usable - 1])
-
-            # Build window indices
-            max_start = usable - seq_len - frame_stack + 1
-            for s in range(frame_stack - 1, frame_stack - 1 + max_start):
-                self._window_index.append((ep_idx, s))
+                # Build window indices
+                max_start = usable - seq_len - frame_stack + 1
+                for s in range(frame_stack - 1, frame_stack - 1 + max_start):
+                    self._window_index.append((ep_idx, s))
 
         total_frames = sum(f.shape[0] for f in self._episode_frames)
         mb = sum(f.nbytes for f in self._episode_frames) / 1024 / 1024
