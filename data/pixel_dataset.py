@@ -118,6 +118,10 @@ class PixelFrameDataset(Dataset):
     Pre-loads all frames into RAM at init. __getitem__ is a pure
     array index — zero I/O during training.
 
+    If cache_path is provided, saves/loads preprocessed frames as a
+    single .npy file for instant loading on subsequent runs (~2s vs ~10min).
+    Cache is per-split: include the split name in cache_path.
+
     Args:
         data_path: directory with .npz episode files
         frame_size: target resolution (square)
@@ -125,14 +129,23 @@ class PixelFrameDataset(Dataset):
         split: "train", "val", or None
         val_fraction: fraction for validation
         seed: RNG seed for split
+        cache_path: optional path to save/load preprocessed frames (.npy)
     """
 
     def __init__(self, data_path: str | Path, frame_size: int = 84,
                  grayscale: bool = True, split: str | None = None,
                  val_fraction: float = 0.1, seed: int = 0,
-                 n_workers: int = 8):
+                 n_workers: int = 8, cache_path: str | Path | None = None):
         self.frame_size = frame_size
         self.grayscale = grayscale
+
+        # Try loading from cache first
+        if cache_path is not None and Path(cache_path).exists():
+            print(f"Loading cached frames from {cache_path} ...")
+            self._frames = np.load(str(cache_path))
+            mb = self._frames.nbytes / 1024 / 1024
+            print(f"PixelFrameDataset: {self._frames.shape[0]} frames ({mb:.0f} MB, from cache)")
+            return
 
         data_path = Path(data_path)
         npz_files = sorted(data_path.glob("**/*.npz"))
@@ -156,6 +169,12 @@ class PixelFrameDataset(Dataset):
         mb = self._frames.nbytes / 1024 / 1024
         print(f"PixelFrameDataset: {n_total} frames from {len(episodes)} episodes "
               f"({mb:.0f} MB in RAM)")
+
+        # Save cache for instant loading next time
+        if cache_path is not None and n_total > 0:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            np.save(str(cache_path), self._frames)
+            print(f"Saved frame cache to {cache_path}")
 
     def __len__(self) -> int:
         return self._frames.shape[0]

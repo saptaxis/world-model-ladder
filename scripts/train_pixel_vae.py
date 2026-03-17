@@ -53,6 +53,8 @@ def parse_args():
                    help="DataLoader workers for batch prefetching")
     p.add_argument("--load-workers", type=int, default=8,
                    help="Parallel workers for initial npz loading")
+    p.add_argument("--cache-dir", type=str, default=None,
+                   help="Dir to cache preprocessed frames (.npy). Instant load on reruns.")
     p.add_argument("--grayscale", action="store_true", default=True)
     p.add_argument("--no-grayscale", dest="grayscale", action="store_false")
     return p.parse_args()
@@ -66,17 +68,25 @@ def main():
     vae_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = str(vae_dir)
 
-    # Data
+    # Data — use cache if available for instant loading
+    cache_train = None
+    cache_val = None
+    if args.cache_dir:
+        cache_dir = Path(args.cache_dir)
+        gs_tag = "gray" if args.grayscale else "rgb"
+        cache_train = cache_dir / f"frames_train_{args.frame_size}_{gs_tag}.npy"
+        cache_val = cache_dir / f"frames_val_{args.frame_size}_{gs_tag}.npy"
+
     print(f"Loading data from {args.data_path} ...")
     train_ds = PixelFrameDataset(
         args.data_path, frame_size=args.frame_size,
         grayscale=args.grayscale, split="train",
-        n_workers=args.load_workers,
+        n_workers=args.load_workers, cache_path=cache_train,
     )
     val_ds = PixelFrameDataset(
         args.data_path, frame_size=args.frame_size,
         grayscale=args.grayscale, split="val",
-        n_workers=args.load_workers,
+        n_workers=args.load_workers, cache_path=cache_val,
     )
     print(f"  Train: {len(train_ds)} frames, Val: {len(val_ds)} frames")
 
