@@ -65,8 +65,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Directories
-    vae_dir = Path(args.run_dir) / "vae"
+    # Directories — run_dir IS the VAE run dir (not a parent)
+    vae_dir = Path(args.run_dir)
     vae_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = str(vae_dir)
 
@@ -116,7 +116,7 @@ def main():
     # TensorBoard
     writer = SummaryWriter(log_dir=str(vae_dir / "tb"))
 
-    # Config dict for checkpoint saving
+    # Config dict — saved to checkpoint AND config.json for reproducibility
     config = {
         "in_channels": in_ch,
         "latent_dim": args.latent_dim,
@@ -126,7 +126,15 @@ def main():
         "fg_weight": args.fg_weight,
         "lr": args.lr,
         "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "grad_clip": args.grad_clip,
+        "data_path": args.data_path,
+        "grayscale": args.grayscale,
     }
+    import json
+    with open(vae_dir / "config.json", "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Config saved to {vae_dir / 'config.json'}")
 
     # Callbacks
     # Get a sample batch for ReconGridCallback
