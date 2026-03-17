@@ -105,10 +105,33 @@ def main():
     grayscale = vae_cfg["in_channels"] == 1
     print(f"  VAE: latent_dim={latent_dim}, frame_size={frame_size}")
 
-    # Directories
-    dyn_dir = Path(args.run_dir) / "dynamics"
+    # Directories — run_dir IS the dynamics run dir (not a parent)
+    dyn_dir = Path(args.run_dir)
     dyn_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = str(dyn_dir)
+
+    # Dump full config so we know exactly what this run was trained with
+    import json
+    run_config = {
+        "vae_checkpoint": str(Path(args.vae_checkpoint).resolve()),
+        "vae_config": vae_cfg,
+        "data_path": args.data_path,
+        "hidden_size": args.hidden_size,
+        "action_dim": args.action_dim,
+        "seq_len": args.seq_len,
+        "frame_stack": args.frame_stack,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "grad_clip": args.grad_clip,
+        "sampling_start": args.sampling_start,
+        "sampling_end": args.sampling_end,
+        "sampling_warmup_frac": args.sampling_warmup_frac,
+        "device": args.device,
+    }
+    with open(dyn_dir / "config.json", "w") as f:
+        json.dump(run_config, f, indent=2)
+    print(f"Config saved to {dyn_dir / 'config.json'}")
 
     # Data
     print(f"Loading data from {args.data_path} ...")
