@@ -16,6 +16,7 @@ from training.pixel_losses import vae_loss, latent_dynamics_loss
 
 
 def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
+                          fg_weight: float = 1.0,
                           device: str = "cpu", max_grad_norm: float = 1.0,
                           ctx=None, callbacks=None) -> dict:
     """One VAE training epoch with callback dispatch."""
@@ -32,7 +33,8 @@ def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
 
         x = batch.to(device) if isinstance(batch, torch.Tensor) else batch[0].to(device)
         recon, mu, logvar = model(x)
-        loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar, beta)
+        loss, recon_loss, kl_loss = vae_loss(recon, x, mu, logvar, beta,
+                                             fg_weight=fg_weight)
 
         optimizer.zero_grad()
         loss.backward()

@@ -40,6 +40,8 @@ def parse_args():
     p.add_argument("--in-channels", type=int, default=1)
     p.add_argument("--channels", type=int, nargs="+", default=[32, 64, 128, 256])
     p.add_argument("--beta", type=float, default=0.0001)
+    p.add_argument("--fg-weight", type=float, default=1.0,
+                   help="Foreground pixel weight in recon loss. >1 upweights lander/flames vs sky/terrain.")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--epochs", type=int, default=50)
@@ -121,6 +123,7 @@ def main():
         "frame_size": args.frame_size,
         "channels": args.channels,
         "beta": args.beta,
+        "fg_weight": args.fg_weight,
         "lr": args.lr,
         "batch_size": args.batch_size,
     }
@@ -134,6 +137,7 @@ def main():
     callbacks = [
         PixelVAEValidationCallback(
             val_loader=val_loader, beta=args.beta,
+            fg_weight=args.fg_weight,
             every_n_steps=args.val_every, patience=args.patience,
             checkpoint_dir=ckpt_dir,
         ),
@@ -180,7 +184,8 @@ def main():
         ctx.epoch = epoch
         result = pixel_vae_train_epoch(
             vae, train_loader, optimizer,
-            beta=args.beta, device=args.device,
+            beta=args.beta, fg_weight=args.fg_weight,
+            device=args.device,
             max_grad_norm=args.grad_clip,
             ctx=ctx, callbacks=callbacks,
         )

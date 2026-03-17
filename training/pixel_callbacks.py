@@ -24,10 +24,12 @@ class PixelVAEValidationCallback(TrainCallback):
     """VAE validation with early stopping and best-checkpoint saving."""
 
     def __init__(self, val_loader, beta: float = 0.0001,
+                 fg_weight: float = 1.0,
                  every_n_steps: int = 500, patience: int = 10,
                  checkpoint_dir: str | None = None):
         self.val_loader = val_loader
         self.beta = beta
+        self.fg_weight = fg_weight
         self.every_n_steps = every_n_steps
         self.patience = patience
         self.checkpoint_dir = checkpoint_dir
@@ -57,7 +59,8 @@ class PixelVAEValidationCallback(TrainCallback):
             for batch in self.val_loader:
                 x = batch.to(ctx.device) if isinstance(batch, torch.Tensor) else batch[0].to(ctx.device)
                 recon, mu, logvar = ctx.model(x)
-                loss, recon_l, kl_l = vae_loss(recon, x, mu, logvar, self.beta)
+                loss, recon_l, kl_l = vae_loss(recon, x, mu, logvar, self.beta,
+                                               fg_weight=self.fg_weight)
                 total_loss += loss.item()
                 total_recon += recon_l.item()
                 total_kl += kl_l.item()
