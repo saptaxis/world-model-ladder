@@ -2,8 +2,9 @@
 """Tests for pixel-space loss functions."""
 import torch
 import pytest
-from training.pixel_losses import vae_loss, latent_dynamics_loss, multi_step_latent_loss
+from training.pixel_losses import vae_loss, latent_dynamics_loss, multi_step_latent_loss, latent_elbo_loss
 from models.pixel_dynamics import LatentDynamicsModel
+from models.pixel_rssm import LatentRSSM
 
 
 class TestVAELoss:
@@ -72,3 +73,35 @@ class TestMultiStepLatentLoss:
         # k=10 > T-1=3, should clamp to 3
         loss = multi_step_latent_loss(model, z_seq, actions, k=10)
         assert loss.dim() == 0
+
+
+class TestLatentELBOLoss:
+    def test_output_is_scalar(self):
+        """ELBO loss returns a scalar tensor."""
+        model = LatentRSSM(latent_dim=8, action_dim=2, deter_dim=16, stoch_dim=4, hidden_dim=16)
+        z_seq = torch.randn(2, 6, 8)
+        actions = torch.randn(2, 5, 2)
+        loss = latent_elbo_loss(model, z_seq, actions, k=4, kl_weight=1.0)
+        assert loss.dim() == 0
+        assert loss.item() > 0
+
+    def test_kl_weight_affects_loss(self):
+        """Higher kl_weight increases total loss."""
+        model = LatentRSSM(latent_dim=8, action_dim=2, deter_dim=16, stoch_dim=4, hidden_dim=16)
+        z_seq = torch.randn(2, 6, 8)
+        actions = torch.randn(2, 5, 2)
+        loss_kl1 = latent_elbo_loss(model, z_seq, actions, k=4, kl_weight=1.0)
+        loss_kl10 = latent_elbo_loss(model, z_seq, actions, k=4, kl_weight=10.0)
+        # Higher KL weight should change the loss (unless KL is exactly 0)
+        assert not torch.allclose(loss_kl1, loss_kl10)
+
+    def test_returns_breakdown_when_requested(self):
+        """Can return (total, recon, kl) breakdown."""
+        model = LatentRSSM(latent_dim=8, action_dim=2, deter_dim=16, stoch_dim=4, hidden_dim=16)
+        z_seq = torch.randn(2, 6, 8)
+        actions = torch.randn(2, 5, 2)
+        total, recon, kl = latent_elbo_loss(
+            model, z_seq, actions, k=4, kl_weight=1.0, return_breakdown=True)
+        assert total.dim() == 0
+        assert recon.item() >= 0
+        assert kl.item() >= 0

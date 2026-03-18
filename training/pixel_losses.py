@@ -127,3 +127,64 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
     # Compare predicted latents (skip seed) to ground-truth targets
     # MSE averaged over batch, time steps, and latent dims
     return F.mse_loss(z_pred[:, 1:], z_seq[:, 1:k + 1])
+
+
+def latent_elbo_loss(model: torch.nn.Module,
+                     z_seq: torch.Tensor,
+                     actions: torch.Tensor,
+                     k: int,
+                     kl_weight: float = 1.0,
+                     return_breakdown: bool = False,
+                     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """ELBO loss for latent RSSM: reconstruction MSE + KL(posterior || prior).
+
+    Loops k steps calling model.step() (posterior path). At each step t:
+    - Posterior observes z_t (current encoded GT) to refine latent state
+    - Decoder predicts z_{t+1} from [deter, posterior_sample]
+    - Reconstruction loss: MSE(z_{t+1}_pred, z_{t+1}_gt)
+    - KL: pushes posterior toward prior so prior is good for dreaming
+
+    The observation (z_t) and target (z_{t+1}) are different — the posterior
+    sees the current frame, the loss evaluates the next-frame prediction.
+    This prevents trivial solutions where the posterior just passes through.
+
+    Args:
+        model: LatentRSSM with step(z_obs, action, state) and kl_loss(state).
+        z_seq: (B, T, latent_dim) encoded GT latent sequence.
+        actions: (B, T-1, action_dim) actions between frames.
+        k: number of steps. Clamped to min(k, T-1, len(actions)).
+        kl_weight: scalar weight for KL divergence term.
+        return_breakdown: if True, return (total, recon_loss, kl_loss).
+
+    Returns:
+        Scalar loss, or (total, recon, kl) tuple if return_breakdown=True.
+    """
+    B = z_seq.size(0)
+    T = z_seq.size(1)
+    n_actions = actions.size(1)
+    # Clamp k to available data — avoids index-out-of-bounds
+    k = min(k, T - 1, n_actions)
+    device = z_seq.device
+
+    recon_terms = []
+    kl_terms = []
+    # Start from a zero-initialized recurrent state
+    model_state = model.initial_state(B, device)
+
+    for t in range(k):
+        # Posterior observes z_t (current GT frame), predicts z_{t+1}
+        z_next_pred, model_state = model.step(z_seq[:, t], actions[:, t], model_state)
+        # Reconstruction: how well z_{t+1}_pred matches actual z_{t+1}
+        recon_terms.append(F.mse_loss(z_next_pred, z_seq[:, t + 1]))
+        # KL(posterior || prior): ensures prior can dream without observations
+        kl_terms.append(model.kl_loss(model_state))
+
+    # Average over time steps — treats each step equally regardless of k
+    recon_loss = torch.stack(recon_terms).mean()
+    kl_loss = torch.stack(kl_terms).mean()
+    # Total ELBO: reconstruction + weighted KL
+    total = recon_loss + kl_weight * kl_loss
+
+    if return_breakdown:
+        return total, recon_loss, kl_loss
+    return total
