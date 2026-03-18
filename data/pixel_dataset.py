@@ -11,6 +11,7 @@ this uses ~2-3 GB RAM.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import cv2
@@ -189,7 +190,11 @@ class PixelFrameDataset(Dataset):
             data_path = [data_path]
         npz_files = []
         for dp in data_path:
-            npz_files.extend(sorted(Path(dp).glob("**/*.npz")))
+            for root, _dirs, files in os.walk(str(Path(dp)), followlinks=True):
+                for f in files:
+                    if f.endswith(".npz"):
+                        npz_files.append(Path(root) / f)
+        npz_files.sort()
         npz_files = [f for f in npz_files if "prepared" not in f.name]
         episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
@@ -309,7 +314,11 @@ class PixelEpisodeDataset(Dataset):
                 data_path = [data_path]
             npz_files = []
             for dp in data_path:
-                npz_files.extend(sorted(Path(dp).glob("**/*.npz")))
+                for root, dirs, files in os.walk(str(Path(dp)), followlinks=True):
+                    for f in files:
+                        if f.endswith(".npz"):
+                            npz_files.append(Path(root) / f)
+            npz_files.sort()
             npz_files = [f for f in npz_files if "prepared" not in f.name]
             episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
