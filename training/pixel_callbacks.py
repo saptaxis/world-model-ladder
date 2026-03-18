@@ -124,10 +124,13 @@ class ReconGridCallback(TrainCallback):
         if ctx.writer is None:
             return True
 
-        # Sample random batch from val each time
-        batch = next(iter(self.val_loader))
-        x = batch.to(ctx.device) if isinstance(batch, torch.Tensor) else batch[0].to(ctx.device)
-        x = x[:8]
+        # Sample random frames from val dataset
+        dataset = self.val_loader.dataset
+        indices = torch.randperm(len(dataset))[:8]
+        frames = [dataset[i] for i in indices]
+        if isinstance(frames[0], tuple):
+            frames = [f[0] for f in frames]
+        x = torch.stack(frames).to(ctx.device)
 
         ctx.model.eval()
         with torch.no_grad():
