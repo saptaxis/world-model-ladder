@@ -200,16 +200,23 @@ class PixelFrameDataset(Dataset):
         episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
         if state_dim > 0:
-            # Load frames + states in parallel
-            from multiprocessing import Pool
-            args = [(path, frame_size, grayscale, state_dim) for path in episode_files]
+            # Load frames + states
+            load_args = [(path, frame_size, grayscale, state_dim) for path in episode_files]
             all_frames = []
             all_states = []
-            with Pool(n_workers) as pool:
-                for frames, states in tqdm(
-                    pool.imap(_load_one_episode_states, args),
-                    total=len(args), desc="Loading frames+states", unit="ep",
-                ):
+            if n_workers > 1:
+                from multiprocessing import Pool
+                with Pool(n_workers) as pool:
+                    iterator = pool.imap(_load_one_episode_states, load_args)
+                    for frames, states in tqdm(iterator, total=len(load_args),
+                                               desc="Loading frames+states", unit="ep"):
+                        if frames is not None:
+                            all_frames.append(frames)
+                            if states is not None:
+                                all_states.append(states)
+            else:
+                for a in tqdm(load_args, desc="Loading frames+states", unit="ep"):
+                    frames, states = _load_one_episode_states(a)
                     if frames is not None:
                         all_frames.append(frames)
                         if states is not None:
