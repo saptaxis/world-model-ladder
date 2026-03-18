@@ -60,6 +60,30 @@ class TestPixelWorldModel:
         assert frames.shape == (1, 4, 4, 84, 84)
 
 
+def test_dream_with_rssm_dynamics():
+    """PixelWorldModel.dream() works with LatentRSSM dynamics."""
+    from models.pixel_rssm import LatentRSSM
+    vae = PixelVAE(in_channels=1, latent_dim=16, frame_size=64, channels=[8, 16, 32, 64])
+    rssm = LatentRSSM(latent_dim=16, action_dim=2, deter_dim=32, stoch_dim=8, hidden_dim=32)
+    model = PixelWorldModel(vae, rssm)
+    seed = torch.rand(1, 1, 64, 64)
+    actions = torch.randn(1, 5, 2)
+    frames = model.dream(seed, actions)
+    assert frames.shape == (1, 6, 1, 64, 64)
+
+def test_dream_from_latent_with_rssm():
+    """dream_from_latent works with LatentRSSM."""
+    from models.pixel_rssm import LatentRSSM
+    vae = PixelVAE(in_channels=1, latent_dim=16, frame_size=64, channels=[8, 16, 32, 64])
+    rssm = LatentRSSM(latent_dim=16, action_dim=2, deter_dim=32, stoch_dim=8, hidden_dim=32)
+    model = PixelWorldModel(vae, rssm)
+    z = torch.randn(1, 16)
+    actions = torch.randn(1, 5, 2)
+    frames, z_seq = model.dream_from_latent(z, actions)
+    assert frames.shape == (1, 6, 1, 64, 64)
+    assert z_seq.shape == (1, 6, 16)
+
+
 class TestPixelSmokeTest:
     """Smoke test with a real Lunar Lander episode."""
 

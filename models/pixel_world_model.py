@@ -12,13 +12,17 @@ import torch
 import torch.nn as nn
 
 from models.pixel_vae import PixelVAE
-from models.pixel_dynamics import LatentDynamicsModel
 
 
 class PixelWorldModel(nn.Module):
-    """Combined pixel world model: VAE encoder-decoder + GRU latent dynamics."""
+    """Combined pixel world model: VAE encoder-decoder + latent dynamics.
 
-    def __init__(self, vae: PixelVAE, dynamics: LatentDynamicsModel):
+    Accepts any dynamics module that implements forward(z, action, state)
+    and rollout(z_start, actions) — both LatentDynamicsModel (GRU) and
+    LatentRSSM satisfy this interface.
+    """
+
+    def __init__(self, vae: PixelVAE, dynamics: nn.Module):
         super().__init__()
         self.vae = vae
         self.dynamics = dynamics
