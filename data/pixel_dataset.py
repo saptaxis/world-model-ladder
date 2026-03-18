@@ -276,9 +276,9 @@ class PixelFrameDataset(Dataset):
         return self._frames.shape[0]
 
     def __getitem__(self, idx: int) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        frame = _frame_to_tensor(self._frames[idx])
+        frame = _frame_to_tensor(np.array(self._frames[idx]))  # copy from mmap
         if self._states is not None:
-            state = torch.from_numpy(self._states[idx]).float()
+            state = torch.from_numpy(np.array(self._states[idx])).float()
             return frame, state
         return frame
 
