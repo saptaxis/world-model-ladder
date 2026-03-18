@@ -101,7 +101,7 @@ def main():
     val_ds = PixelFrameDataset(
         args.data_path, frame_size=args.frame_size,
         grayscale=args.grayscale, split="val",
-        n_workers=1, cache_path=cache_val,  # serial load — avoid forking after 18GB train data in memory
+        n_workers=args.load_workers, cache_path=cache_val,
         state_dim=args.state_dim,
     )
     print(f"  Train: {len(train_ds)} frames, Val: {len(val_ds)} frames")
