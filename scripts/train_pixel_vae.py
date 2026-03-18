@@ -163,11 +163,6 @@ def main():
     print(f"Config saved to {vae_dir / 'config.json'}")
 
     # Callbacks
-    # Get a sample batch for ReconGridCallback
-    sample_batch = next(iter(val_loader))
-    if isinstance(sample_batch, (list, tuple)):
-        sample_batch = sample_batch[0]
-
     callbacks = [
         PixelVAEValidationCallback(
             val_loader=val_loader, beta=args.beta,
@@ -177,7 +172,7 @@ def main():
             checkpoint_dir=ckpt_dir,
         ),
         CheckpointCallback(checkpoint_dir=ckpt_dir, every_n_steps=args.ckpt_every),
-        ReconGridCallback(sample_batch=sample_batch, every_n_steps=args.val_every),
+        ReconGridCallback(val_loader=val_loader, every_n_steps=args.val_every),
         GradNormCallback(every_n_steps=50),
         NaNDetectionCallback(),
         ProgressCallback(every_n_steps=100, total_epochs=args.epochs),

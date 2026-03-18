@@ -80,8 +80,8 @@ class TestPixelVAEValidationCallback:
 class TestReconGridCallback:
     def test_logs_grid(self, vae, ctx):
         """ReconGridCallback produces reconstruction grid without error."""
-        sample = torch.rand(8, 1, 84, 84)
-        cb = ReconGridCallback(sample_batch=sample, every_n_steps=5)
+        val_loader = [torch.rand(8, 1, 84, 84)]
+        cb = ReconGridCallback(val_loader=val_loader, every_n_steps=5)
 
         ctx.global_step = 5
         result = cb.on_step(ctx)

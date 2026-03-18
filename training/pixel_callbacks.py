@@ -114,8 +114,8 @@ class PixelVAEValidationCallback(TrainCallback):
 class ReconGridCallback(TrainCallback):
     """Log reconstruction grid (original vs reconstructed) to TensorBoard."""
 
-    def __init__(self, sample_batch: torch.Tensor, every_n_steps: int = 500):
-        self.sample_batch = sample_batch[:8]
+    def __init__(self, val_loader, every_n_steps: int = 500):
+        self.val_loader = val_loader
         self.every_n_steps = every_n_steps
 
     def on_step(self, ctx: CallbackContext) -> bool:
@@ -124,9 +124,13 @@ class ReconGridCallback(TrainCallback):
         if ctx.writer is None:
             return True
 
+        # Sample random batch from val each time
+        batch = next(iter(self.val_loader))
+        x = batch.to(ctx.device) if isinstance(batch, torch.Tensor) else batch[0].to(ctx.device)
+        x = x[:8]
+
         ctx.model.eval()
         with torch.no_grad():
-            x = self.sample_batch.to(ctx.device)
             recon, _, _, _ = ctx.model(x)
             pairs = torch.stack([x, recon], dim=1).reshape(-1, *x.shape[1:])
             try:
