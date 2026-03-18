@@ -66,7 +66,8 @@ def get_sampling_prob(epoch: int, total_epochs: int,
 def parse_args():
     p = argparse.ArgumentParser(description="Train LatentDynamicsModel")
     p.add_argument("--vae-checkpoint", type=str, required=True)
-    p.add_argument("--data-path", type=str, required=True)
+    p.add_argument("--data-path", type=str, nargs="+", required=True,
+                   help="One or more directories with .npz episode files")
     p.add_argument("--run-dir", type=str, default="runs/pixel-wm")
     p.add_argument("--hidden-size", type=int, default=256)
     p.add_argument("--action-dim", type=int, default=2)

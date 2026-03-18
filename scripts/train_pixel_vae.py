@@ -33,7 +33,8 @@ from training.pixel_loop import pixel_vae_train_epoch
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train PixelVAE")
-    p.add_argument("--data-path", type=str, required=True)
+    p.add_argument("--data-path", type=str, nargs="+", required=True,
+                   help="One or more directories with .npz episode files")
     p.add_argument("--run-dir", type=str, default="runs/pixel-vae")
     p.add_argument("--frame-size", type=int, default=84)
     p.add_argument("--latent-dim", type=int, default=64)

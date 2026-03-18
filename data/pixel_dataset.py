@@ -153,7 +153,8 @@ class PixelFrameDataset(Dataset):
         state_dim: if > 0, load and return states (first N dims from .npz states)
     """
 
-    def __init__(self, data_path: str | Path, frame_size: int = 84,
+    def __init__(self, data_path: str | Path | list[str | Path],
+                 frame_size: int = 84,
                  grayscale: bool = True, split: str | None = None,
                  val_fraction: float = 0.1, seed: int = 0,
                  n_workers: int = 8, cache_path: str | Path | None = None,
@@ -183,8 +184,12 @@ class PixelFrameDataset(Dataset):
             print(f"PixelFrameDataset: {self._frames.shape[0]} frames{state_str} ({mb:.0f} MB, from cache)")
             return
 
-        data_path = Path(data_path)
-        npz_files = sorted(data_path.glob("**/*.npz"))
+        # Normalize to list of paths
+        if isinstance(data_path, (str, Path)):
+            data_path = [data_path]
+        npz_files = []
+        for dp in data_path:
+            npz_files.extend(sorted(Path(dp).glob("**/*.npz")))
         npz_files = [f for f in npz_files if "prepared" not in f.name]
         episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
@@ -265,7 +270,8 @@ class PixelEpisodeDataset(Dataset):
         split, val_fraction, seed: train/val splitting
     """
 
-    def __init__(self, data_path: str | Path, frame_size: int = 84,
+    def __init__(self, data_path: str | Path | list[str | Path],
+                 frame_size: int = 84,
                  grayscale: bool = True, seq_len: int = 20,
                  frame_stack: int = 1, split: str | None = None,
                  val_fraction: float = 0.1, seed: int = 0,
@@ -299,8 +305,11 @@ class PixelEpisodeDataset(Dataset):
                 for s in range(frame_stack - 1, frame_stack - 1 + max_start):
                     self._window_index.append((ep_idx, s))
         else:
-            data_path = Path(data_path)
-            npz_files = sorted(data_path.glob("**/*.npz"))
+            if isinstance(data_path, (str, Path)):
+                data_path = [data_path]
+            npz_files = []
+            for dp in data_path:
+                npz_files.extend(sorted(Path(dp).glob("**/*.npz")))
             npz_files = [f for f in npz_files if "prepared" not in f.name]
             episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
