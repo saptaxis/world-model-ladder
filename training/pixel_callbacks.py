@@ -7,12 +7,16 @@ NaNDetectionCallback, ProgressCallback, PlotExportCallback) work directly
 with pixel training loops -- no changes needed.
 
 These callbacks handle pixel-specific concerns: VAE validation with
-reconstruction+KL loss, reconstruction grid logging, dream sequence logging.
+reconstruction+KL loss, reconstruction grid logging, dream sequence logging,
+kinematics validation, dream comparison video export, and RSSM diagnostics.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -330,4 +334,391 @@ class DreamGridCallback(TrainCallback):
             except ImportError:
                 pass
         ctx.model.train()
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Helpers for loading raw npz episodes
+# ---------------------------------------------------------------------------
+
+def _load_npz_episode(
+    path: str,
+    frame_size: int = 64,
+) -> dict:
+    """Load a raw npz episode file and preprocess for callback use.
+
+    Returns a dict with tensors ready for VAE consumption:
+      - frames: (T+1, 1, frame_size, frame_size) float32 [0,1]
+      - actions: (T, 2) float32
+      - states: (T+1, state_dim) float32
+      - source_label: str describing the episode source (e.g. "heuristic")
+    """
+    data = np.load(path, allow_pickle=True)
+
+    # --- Preprocess frames to match VAE training: grayscale, 64x64, [0,1] ---
+    raw_frames = data["rgb_frames"]  # (T+1, H, W, 3) uint8
+    processed = []
+    for frame in raw_frames:
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        resized = cv2.resize(gray, (frame_size, frame_size),
+                             interpolation=cv2.INTER_AREA)
+        # Shape: (1, H, W) float32 normalised to [0,1]
+        tensor = torch.from_numpy(resized).float().unsqueeze(0) / 255.0
+        processed.append(tensor)
+    frames = torch.stack(processed)  # (T+1, 1, frame_size, frame_size)
+
+    actions = torch.from_numpy(data["actions"].astype(np.float32))
+    states = torch.from_numpy(data["states"].astype(np.float32))
+
+    # --- Parse source metadata for file naming ---
+    source_label = "unknown"
+    try:
+        if "metadata_json" in data:
+            meta = json.loads(str(data["metadata_json"]))
+            source_type = meta.get("source_type", "unknown")
+            if source_type == "primitive":
+                maneuver = meta.get("maneuver_type", "unknown")
+                source_label = f"primitive_{maneuver}"
+            else:
+                source_label = source_type
+    except (json.JSONDecodeError, KeyError, TypeError):
+        # Gracefully handle missing or malformed metadata
+        pass
+
+    return {
+        "frames": frames,
+        "actions": actions,
+        "states": states,
+        "source_label": source_label,
+    }
+
+
+# ---------------------------------------------------------------------------
+# KinematicsValidationCallback
+# ---------------------------------------------------------------------------
+
+# Canonical kinematic dimension names for the first 6 state dims
+_KINEMATICS_DIMS = ["x", "y", "vx", "vy", "angle", "ang_vel"]
+
+
+class KinematicsValidationCallback(TrainCallback):
+    """Validate dreamed kinematics against ground-truth states.
+
+    Loads raw npz episodes at init, encodes GT frames via the VAE, rolls
+    out dreamed latents via the dynamics model, predicts kinematic state
+    from the dreamed latents using the VAE's state head, and logs per-dim
+    MSE at specified horizons.
+
+    No-ops silently when the VAE has no state head (state_dim == 0) --
+    this lets the callback be unconditionally wired into the training
+    script without conditional logic.
+    """
+
+    def __init__(
+        self,
+        vae: nn.Module,
+        episode_paths: list[str],
+        every_n_steps: int = 2000,
+        horizons: list[int] | None = None,
+        frame_size: int = 64,
+    ):
+        self.vae = vae
+        self.every_n_steps = every_n_steps
+        self.horizons = horizons or [1, 5, 10]
+        self.frame_size = frame_size
+
+        # Early exit marker -- checked in on_step to skip all work
+        self.active = getattr(vae, "state_dim", 0) > 0
+
+        # Pre-load episodes so on_step is fast (no I/O)
+        self.episodes: list[dict] = []
+        if self.active:
+            for p in episode_paths:
+                self.episodes.append(_load_npz_episode(p, frame_size))
+
+    def on_step(self, ctx: CallbackContext) -> bool:
+        if not self.active:
+            return True
+        if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
+            return True
+        if ctx.writer is None:
+            return True
+
+        device = ctx.device
+        self.vae.eval()
+        ctx.model.eval()
+
+        with torch.no_grad():
+            # Accumulate squared errors per horizon per dim across episodes
+            # horizon -> list of (n_dims,) tensors
+            errors: dict[int, list[torch.Tensor]] = {h: [] for h in self.horizons}
+
+            for ep in self.episodes:
+                frames = ep["frames"].to(device)   # (T+1, 1, H, W)
+                actions = ep["actions"].to(device)  # (T, 2)
+                gt_states = ep["states"].to(device)  # (T+1, state_dim)
+                # Only use the first 6 kinematic dims
+                gt_kin = gt_states[:, :6]
+
+                # Encode all GT frames to latent space
+                z_gt = self.vae.encode(frames)  # (T+1, latent_dim)
+
+                # Dream: rollout from z_0 using actions
+                z_dream, _ = ctx.model.rollout(
+                    z_gt[0:1], actions.unsqueeze(0)
+                )  # (1, T+1, latent_dim)
+                z_dream = z_dream.squeeze(0)  # (T+1, latent_dim)
+
+                # Predict kinematic state from dreamed latents
+                pred_kin = self.vae.predict_state(z_dream)  # (T+1, state_dim)
+                if pred_kin is None:
+                    continue
+                pred_kin = pred_kin[:, :6]
+
+                T_actions = actions.shape[0]
+                for h in self.horizons:
+                    if h <= T_actions:
+                        # Per-dim squared error at horizon h
+                        err = (pred_kin[h] - gt_kin[h]).pow(2)  # (6,)
+                        errors[h].append(err)
+
+            # Log mean per-dim MSE at each horizon
+            for h in self.horizons:
+                if not errors[h]:
+                    continue
+                mean_err = torch.stack(errors[h]).mean(dim=0)  # (6,)
+                for i, dim_name in enumerate(_KINEMATICS_DIMS):
+                    if i < mean_err.shape[0]:
+                        ctx.writer.add_scalar(
+                            f"kinematics/mse_h{h}_{dim_name}",
+                            mean_err[i].item(),
+                            ctx.global_step,
+                        )
+
+        ctx.model.train()
+        return True
+
+
+# ---------------------------------------------------------------------------
+# DreamComparisonVideoCallback
+# ---------------------------------------------------------------------------
+
+
+class DreamComparisonVideoCallback(TrainCallback):
+    """Export GT|Dream side-by-side MP4 videos for qualitative evaluation.
+
+    Loads diverse npz episodes at init (with metadata for naming).
+    At each firing, dreams each episode, creates a side-by-side
+    comparison frame array, and saves as MP4 to the video directory.
+    """
+
+    def __init__(
+        self,
+        vae: nn.Module,
+        episode_paths: list[str],
+        video_dir: str,
+        every_n_steps: int = 5000,
+        fps: int = 10,
+        frame_size: int = 64,
+    ):
+        self.vae = vae
+        self.video_dir = video_dir
+        self.every_n_steps = every_n_steps
+        self.fps = fps
+        self.frame_size = frame_size
+
+        # Pre-load episodes with source labels for file naming
+        self.episodes: list[dict] = []
+        for p in episode_paths:
+            self.episodes.append(_load_npz_episode(p, frame_size))
+
+    def on_step(self, ctx: CallbackContext) -> bool:
+        if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
+            return True
+
+        device = ctx.device
+        self.vae.eval()
+        ctx.model.eval()
+
+        step_dir = Path(self.video_dir) / f"step_{ctx.global_step}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        with torch.no_grad():
+            for ep_idx, ep in enumerate(self.episodes):
+                frames = ep["frames"].to(device)
+                actions = ep["actions"].to(device)
+                label = ep["source_label"]
+
+                # Encode GT frames
+                z_gt = self.vae.encode(frames)
+
+                # Dream from z_0
+                z_dream, _ = ctx.model.rollout(
+                    z_gt[0:1], actions.unsqueeze(0)
+                )
+                z_dream = z_dream.squeeze(0)
+
+                # Decode both GT latents and dreamed latents to pixel space
+                gt_decoded = self.vae.decode(z_gt)    # (T+1, 1, H, W)
+                dream_decoded = self.vae.decode(z_dream)  # (T+1, 1, H, W)
+
+                # Convert to uint8 numpy for video export
+                gt_np = (gt_decoded.squeeze(1).cpu().numpy() * 255).clip(
+                    0, 255
+                ).astype(np.uint8)  # (T+1, H, W)
+                dream_np = (dream_decoded.squeeze(1).cpu().numpy() * 255).clip(
+                    0, 255
+                ).astype(np.uint8)
+
+                # Side-by-side: GT on left, Dream on right
+                T = gt_np.shape[0]
+                combined = np.concatenate(
+                    [gt_np[:T], dream_np[:T]], axis=2
+                )  # (T, H, 2*W)
+
+                # Save as MP4 -- convert grayscale to RGB for codec compat
+                video_path = str(step_dir / f"{label}_{ep_idx}.mp4")
+                self._save_mp4(combined, video_path)
+
+        ctx.model.train()
+        return True
+
+    def _save_mp4(self, frames: np.ndarray, path: str):
+        """Save grayscale frames as MP4 by converting to RGB."""
+        import imageio
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        # Grayscale (T, H, W) -> RGB (T, H, W, 3) for codec compatibility
+        frames_rgb = np.stack([frames] * 3, axis=-1)
+        writer = imageio.get_writer(
+            path, fps=self.fps, codec="libx264", pixelformat="yuv420p"
+        )
+        for frame in frames_rgb:
+            writer.append_data(frame)
+        writer.close()
+
+
+# ---------------------------------------------------------------------------
+# RSSMDiagnosticCallback
+# ---------------------------------------------------------------------------
+
+
+class RSSMDiagnosticCallback(TrainCallback):
+    """RSSM-specific diagnostics: KL tracking and prior/posterior MSE.
+
+    Only active when the dynamics model is a LatentRSSM instance.
+    Silently no-ops for GRU dynamics, so it can be unconditionally
+    wired into the callback list.
+
+    Per-step (cheap -- reads from ctx.extras already computed by training loop):
+      - rssm/kl_per_step: mean KL divergence
+      - rssm/prior_post_divergence: L2 between prior and posterior means
+
+    Per-validation (every_n_steps -- requires forward passes):
+      - rssm/prior_mse: MSE of prior-only dreamed latents vs GT
+      - rssm/posterior_mse: MSE of posterior-stepped latents vs GT
+    """
+
+    def __init__(
+        self,
+        dynamics: nn.Module,
+        episode_paths: list[str],
+        vae: nn.Module,
+        every_n_steps: int = 2000,
+        frame_size: int = 64,
+    ):
+        from models.pixel_rssm import LatentRSSM
+        self.is_rssm = isinstance(dynamics, LatentRSSM)
+        self.every_n_steps = every_n_steps
+        self.vae = vae
+        self.frame_size = frame_size
+
+        # Pre-load episodes for validation-time diagnostics
+        self.episodes: list[dict] = []
+        if self.is_rssm:
+            for p in episode_paths:
+                self.episodes.append(_load_npz_episode(p, frame_size))
+
+    def on_step(self, ctx: CallbackContext) -> bool:
+        if not self.is_rssm:
+            return True
+
+        # --- Per-step cheap metrics from ctx.extras ---
+        if ctx.writer and ctx.global_step > 0:
+            # The training loop stores kl_loss when in ELBO mode
+            kl = ctx.extras.get("kl_loss")
+            if kl is not None:
+                val = kl if isinstance(kl, float) else kl.item()
+                ctx.writer.add_scalar("rssm/kl_per_step", val, ctx.global_step)
+
+            # L2 between prior and posterior means
+            pp_div = ctx.extras.get("prior_post_div")
+            if pp_div is not None:
+                val = pp_div if isinstance(pp_div, float) else pp_div.item()
+                ctx.writer.add_scalar(
+                    "rssm/prior_post_divergence", val, ctx.global_step
+                )
+
+        # --- Periodic validation-time diagnostics ---
+        if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
+            return True
+        if ctx.writer is None:
+            return True
+
+        device = ctx.device
+        self.vae.eval()
+        ctx.model.eval()
+
+        prior_mse_sum = 0.0
+        posterior_mse_sum = 0.0
+        n_episodes = 0
+
+        with torch.no_grad():
+            for ep in self.episodes:
+                frames = ep["frames"].to(device)
+                actions = ep["actions"].to(device)
+                T = actions.shape[0]
+                if T < 2:
+                    continue
+
+                # Encode all GT frames
+                z_gt = self.vae.encode(frames)  # (T+1, latent_dim)
+
+                # --- Prior MSE: dream with rollout() (prior only) ---
+                z_prior, _ = ctx.model.rollout(
+                    z_gt[0:1], actions.unsqueeze(0)
+                )  # (1, T+1, latent_dim)
+                z_prior = z_prior.squeeze(0)  # (T+1, latent_dim)
+                prior_mse = (z_prior[1:] - z_gt[1:]).pow(2).mean().item()
+                prior_mse_sum += prior_mse
+
+                # --- Posterior MSE: step through with model.step() ---
+                state = None
+                post_preds = []
+                for t in range(T):
+                    z_next, state = ctx.model.step(
+                        z_gt[t].unsqueeze(0),
+                        actions[t].unsqueeze(0),
+                        state,
+                    )
+                    post_preds.append(z_next.squeeze(0))
+                z_post = torch.stack(post_preds)  # (T, latent_dim)
+                posterior_mse = (z_post - z_gt[1:]).pow(2).mean().item()
+                posterior_mse_sum += posterior_mse
+
+                n_episodes += 1
+
+        ctx.model.train()
+
+        if n_episodes > 0 and ctx.writer:
+            ctx.writer.add_scalar(
+                "rssm/prior_mse",
+                prior_mse_sum / n_episodes,
+                ctx.global_step,
+            )
+            ctx.writer.add_scalar(
+                "rssm/posterior_mse",
+                posterior_mse_sum / n_episodes,
+                ctx.global_step,
+            )
+
         return True
