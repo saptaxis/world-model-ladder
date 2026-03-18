@@ -57,3 +57,45 @@ class TestPixelDynamicsTrainEpoch:
         result = pixel_dynamics_train_epoch(dynamics, vae, loader, optimizer)
         assert "train_loss" in result
         assert result["train_loss"] > 0
+
+    def test_multi_step_latent_mode(self):
+        """Training epoch with multi_step_latent mode returns loss dict."""
+        vae = PixelVAE(in_channels=1, latent_dim=8, frame_size=64,
+                       channels=[8, 16, 32, 64])
+        vae.eval()
+        for p in vae.parameters():
+            p.requires_grad_(False)
+        dynamics = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        optimizer = torch.optim.Adam(dynamics.parameters(), lr=1e-3)
+        # T=10 frames, T-1=9 actions — standard convention for rollout modes
+        frames = torch.rand(2, 10, 1, 64, 64)
+        actions = torch.randn(2, 9, 2)
+        loader = [(frames, actions)]
+        result = pixel_dynamics_train_epoch(
+            dynamics, vae, loader, optimizer,
+            training_mode="multi_step_latent", rollout_k=4,
+            device="cpu")
+        assert "train_loss" in result
+        assert result["train_loss"] > 0
+
+    def test_latent_elbo_mode(self):
+        """Training epoch with latent_elbo mode returns loss dict with KL."""
+        from models.pixel_rssm import LatentRSSM
+        vae = PixelVAE(in_channels=1, latent_dim=8, frame_size=64,
+                       channels=[8, 16, 32, 64])
+        vae.eval()
+        for p in vae.parameters():
+            p.requires_grad_(False)
+        dynamics = LatentRSSM(latent_dim=8, action_dim=2, deter_dim=16,
+                              stoch_dim=4, hidden_dim=16)
+        optimizer = torch.optim.Adam(dynamics.parameters(), lr=1e-3)
+        # T=10 frames, T-1=9 actions
+        frames = torch.rand(2, 10, 1, 64, 64)
+        actions = torch.randn(2, 9, 2)
+        loader = [(frames, actions)]
+        result = pixel_dynamics_train_epoch(
+            dynamics, vae, loader, optimizer,
+            training_mode="latent_elbo", rollout_k=4, kl_weight=1.0,
+            device="cpu")
+        assert "train_loss" in result
+        assert result["train_loss"] > 0

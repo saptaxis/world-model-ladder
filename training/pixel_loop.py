@@ -12,7 +12,9 @@ import time
 
 import torch
 
-from training.pixel_losses import vae_loss, latent_dynamics_loss
+from training.pixel_losses import (
+    vae_loss, latent_dynamics_loss, multi_step_latent_loss, latent_elbo_loss,
+)
 
 
 def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
@@ -89,8 +91,34 @@ def pixel_vae_train_epoch(model, train_loader, optimizer, beta: float = 0.0001,
 def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
                                sampling_prob: float = 0.0,
                                device: str = "cpu", max_grad_norm: float = 1.0,
-                               ctx=None, callbacks=None) -> dict:
-    """One dynamics training epoch with frozen VAE and callback dispatch."""
+                               ctx=None, callbacks=None,
+                               training_mode: str = "latent_mse",
+                               rollout_k: int = 1,
+                               kl_weight: float = 1.0,
+                               ms_weight: float = 1.0) -> dict:
+    """One dynamics training epoch with frozen VAE and callback dispatch.
+
+    Supports three training modes via loss dispatch:
+    - latent_mse: teacher-forced predict_sequence + MSE (original path)
+    - multi_step_latent: autoregressive rollout with full gradient flow
+    - latent_elbo: posterior-guided RSSM training with KL divergence
+
+    Args:
+        model_dynamics: dynamics model (LatentDynamicsModel or LatentRSSM)
+        vae: frozen VAE encoder for mapping frames -> latent codes
+        train_loader: yields (frames, actions) batches
+        optimizer: optimizer for dynamics parameters
+        sampling_prob: scheduled sampling probability (latent_mse only)
+        device: torch device string
+        max_grad_norm: gradient clipping threshold
+        ctx: CallbackContext for logging and step tracking
+        callbacks: list of TrainCallback instances
+        training_mode: loss dispatch key — "latent_mse", "multi_step_latent",
+            or "latent_elbo"
+        rollout_k: rollout horizon for multi_step_latent and latent_elbo modes
+        kl_weight: KL divergence weight for latent_elbo mode
+        ms_weight: scalar multiplier for multi_step_latent loss
+    """
     model_dynamics.train()
     total_loss = 0.0
     n_batches = 0
@@ -100,28 +128,69 @@ def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
         if ctx is not None:
             ctx.global_step += 1
 
+        # Flatten frames for batch VAE encoding: (B, T, C, H, W) -> (B*T, C, H, W)
         B, T, C, H, W = frames_batch.shape
         frames_flat = frames_batch.reshape(B * T, C, H, W).to(device)
         actions = actions_batch.to(device)
 
+        # Encode all frames with frozen VAE — no gradients through encoder
         with torch.no_grad():
             z_all = vae.encode(frames_flat)
         latent_dim = z_all.shape[-1]
+        # Reshape back to sequence: (B, T, latent_dim)
         z_seq = z_all.reshape(B, T, latent_dim)
 
-        z_pred, _ = model_dynamics.predict_sequence(
-            z_seq, actions, teacher_forcing=1.0 - sampling_prob)
+        # --- Loss dispatch based on training_mode ---
+        if training_mode == "latent_mse":
+            # Original path: teacher-forced predict_sequence + MSE
+            # predict_sequence handles T actions for T frames (legacy convention)
+            z_pred, _ = model_dynamics.predict_sequence(
+                z_seq, actions, teacher_forcing=1.0 - sampling_prob)
+            loss = latent_dynamics_loss(z_pred[:, :-1], z_seq[:, 1:])
 
-        loss = latent_dynamics_loss(z_pred[:, :-1], z_seq[:, 1:])
+        elif training_mode == "multi_step_latent":
+            # Autoregressive rollout with full gradient flow through k steps.
+            # NOTE: For RSSM, this trains the prior directly via rollout()
+            # (which calls imagine_step(), no posterior). This skips the
+            # RSSM's posterior/KL machinery entirely — useful as a
+            # prior-only ablation. Use latent_elbo for full RSSM training.
+            loss = multi_step_latent_loss(
+                model_dynamics, z_seq, actions, k=rollout_k) * ms_weight
+
+        elif training_mode == "latent_elbo":
+            # Full RSSM ELBO: posterior-guided step + KL(posterior || prior)
+            # Returns breakdown for detailed logging of recon vs KL components
+            loss, recon_loss, kl_loss = latent_elbo_loss(
+                model_dynamics, z_seq, actions, k=rollout_k,
+                kl_weight=kl_weight, return_breakdown=True)
+
+        else:
+            raise ValueError(
+                f"Unknown training_mode={training_mode!r}. "
+                f"Expected one of: latent_mse, multi_step_latent, latent_elbo")
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model_dynamics.parameters(), max_grad_norm)
 
         if ctx is not None and callbacks:
+            # Store step-level loss for callbacks to inspect
             ctx.extras["train_loss_step"] = loss.item()
+
+            # ELBO mode: store recon/KL breakdown for diagnostics
+            if training_mode == "latent_elbo":
+                ctx.extras["kl_loss"] = kl_loss.item()
+                ctx.extras["recon_loss"] = recon_loss.item()
+
             if ctx.writer:
                 ctx.writer.add_scalar("train/loss", loss.item(), ctx.global_step)
+                # ELBO mode: log recon + KL breakdown to TensorBoard
+                if training_mode == "latent_elbo":
+                    ctx.writer.add_scalar(
+                        "train/recon_loss", recon_loss.item(), ctx.global_step)
+                    ctx.writer.add_scalar(
+                        "train/kl_loss", kl_loss.item(), ctx.global_step)
+
             for cb in callbacks:
                 if cb.on_step(ctx) is False:
                     stop_requested = True
