@@ -1,21 +1,36 @@
 #!/usr/bin/env python3
-"""Train LatentDynamicsModel (Phase 2 of pixel world model).
+"""Train latent dynamics model (Phase 2 of pixel world model).
 
-Loads a frozen VAE from checkpoint, trains GRU dynamics in latent space.
+Loads a frozen VAE from checkpoint, trains either a GRU or RSSM dynamics
+model in latent space.  Supports multiple training modes:
+  - latent_mse: single-step teacher-forced MSE (GRU only)
+  - multi_step_latent: k-step autoregressive rollout + MSE (GRU or RSSM)
+  - latent_elbo: posterior-guided ELBO with KL (RSSM only)
 
 Usage:
+    # GRU with single-step MSE (original default)
     python scripts/train_pixel_dynamics.py \
         --vae-checkpoint path/to/vae/best.pt \
         --data-path /path/to/episodes \
         --run-dir runs/pixel-wm
+
+    # RSSM with ELBO training
+    python scripts/train_pixel_dynamics.py \
+        --model-type rssm --training-mode latent_elbo \
+        --vae-checkpoint path/to/vae/best.pt \
+        --data-path /path/to/episodes \
+        --run-dir runs/pixel-rssm
 """
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import signal
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -23,6 +38,7 @@ from torch.utils.tensorboard import SummaryWriter
 from data.pixel_dataset import PixelEpisodeDataset
 from models.pixel_vae import PixelVAE
 from models.pixel_dynamics import LatentDynamicsModel
+from models.pixel_rssm import LatentRSSM
 from training.callbacks import (
     CallbackContext,
     CheckpointCallback,
@@ -30,8 +46,26 @@ from training.callbacks import (
     NaNDetectionCallback,
     ProgressCallback,
 )
-from training.pixel_callbacks import PixelDynamicsValidationCallback, DreamGridCallback
+from training.pixel_callbacks import (
+    PixelDynamicsValidationCallback,
+    DreamGridCallback,
+    KinematicsValidationCallback,
+    DreamComparisonVideoCallback,
+    RSSMDiagnosticCallback,
+)
 from training.pixel_loop import pixel_dynamics_train_epoch
+
+# Valid (model_type, training_mode) combinations.  Not every loss function
+# makes sense for every architecture:
+#   - latent_mse requires teacher-forced predict_sequence (GRU only)
+#   - multi_step_latent works with any model that supports rollout()
+#   - latent_elbo requires posterior inference, which only RSSM provides
+VALID_COMBOS = {
+    ("gru", "latent_mse"),
+    ("gru", "multi_step_latent"),
+    ("rssm", "multi_step_latent"),
+    ("rssm", "latent_elbo"),
+}
 
 
 def load_vae(checkpoint_path: str, device: str) -> PixelVAE:
@@ -63,16 +97,71 @@ def get_sampling_prob(epoch: int, total_epochs: int,
     return start + (end - start) * min(progress, 1.0)
 
 
+def _collect_val_episode_paths(data_paths: list[str], n_detail: int = 5) -> list[str]:
+    """Select a few representative val-split npz files for detailed callbacks.
+
+    Uses the same deterministic RNG split logic as PixelEpisodeDataset so we
+    pick from the validation portion.  Returns up to `n_detail` paths.
+    """
+    # Gather all raw npz files (skip any preprocessed cache files)
+    all_npz: list[Path] = []
+    for dp in data_paths:
+        for root, _dirs, files in os.walk(str(Path(dp)), followlinks=True):
+            for f in sorted(files):
+                if f.endswith(".npz") and "prepared" not in f:
+                    all_npz.append(Path(root) / f)
+    all_npz.sort()
+
+    if not all_npz:
+        return []
+
+    # Mirror the 90/10 train/val split from PixelEpisodeDataset (seed=0)
+    rng = np.random.RandomState(0)
+    n_val = max(1, int(len(all_npz) * 0.1))
+    val_indices = rng.permutation(len(all_npz))[:n_val]
+    val_episode_paths = [str(all_npz[i]) for i in sorted(val_indices)]
+
+    # Return a manageable subset for per-episode callbacks
+    return val_episode_paths[:min(n_detail, len(val_episode_paths))]
+
+
 def parse_args():
-    p = argparse.ArgumentParser(description="Train LatentDynamicsModel")
+    p = argparse.ArgumentParser(description="Train latent dynamics (GRU or RSSM)")
     p.add_argument("--vae-checkpoint", type=str, required=True)
     p.add_argument("--data-path", type=str, nargs="+", required=True,
                    help="One or more directories with .npz episode files")
     p.add_argument("--run-dir", type=str, default="runs/pixel-wm")
-    p.add_argument("--hidden-size", type=int, default=256)
+
+    # --- Model architecture selection ---
+    p.add_argument("--model-type", type=str, default="gru",
+                   choices=["gru", "rssm"],
+                   help="Dynamics model architecture (default: gru)")
+    p.add_argument("--training-mode", type=str, default="latent_mse",
+                   choices=["latent_mse", "multi_step_latent", "latent_elbo"],
+                   help="Loss function / training regime (default: latent_mse)")
+
+    # --- Model hyperparameters ---
+    p.add_argument("--hidden-size", type=int, default=256,
+                   help="GRU hidden size or RSSM hidden_dim")
     p.add_argument("--action-dim", type=int, default=2)
+    p.add_argument("--deter-dim", type=int, default=200,
+                   help="RSSM deterministic state dimension (ignored for GRU)")
+    p.add_argument("--stoch-dim", type=int, default=30,
+                   help="RSSM stochastic state dimension (ignored for GRU)")
+
+    # --- Training-mode specific hyperparameters ---
+    p.add_argument("--rollout-k", type=int, default=1,
+                   help="Multi-step rollout horizon for multi_step_latent mode")
+    p.add_argument("--multi-step-weight", type=float, default=1.0,
+                   help="Weight on multi-step loss term")
+    p.add_argument("--kl-weight", type=float, default=1.0,
+                   help="KL divergence weight for latent_elbo mode")
+
+    # --- Sequence / data ---
     p.add_argument("--seq-len", type=int, default=20)
     p.add_argument("--frame-stack", type=int, default=1)
+
+    # --- Optimisation ---
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--epochs", type=int, default=100)
@@ -97,7 +186,16 @@ def parse_args():
                    help="LR reduction factor when plateau detected")
     p.add_argument("--lr-min", type=float, default=1e-6,
                    help="Minimum LR for scheduler")
-    return p.parse_args()
+
+    args = p.parse_args()
+
+    # --- Validate model/mode combination ---
+    # Not every loss function works with every architecture (see VALID_COMBOS).
+    if (args.model_type, args.training_mode) not in VALID_COMBOS:
+        p.error(f"Invalid combination: --model-type {args.model_type} "
+                f"with --training-mode {args.training_mode}")
+
+    return args
 
 
 def main():
@@ -113,25 +211,33 @@ def main():
     grayscale = vae_cfg["in_channels"] == 1
     print(f"  VAE: latent_dim={latent_dim}, frame_size={frame_size}")
 
-    # Directories — run_dir IS the dynamics run dir (not a parent)
+    # Directories -- run_dir IS the dynamics run dir (not a parent)
     dyn_dir = Path(args.run_dir)
     dyn_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = str(dyn_dir)
 
-    # Dump full config so we know exactly what this run was trained with
-    import json
+    # Dump full config so we know exactly what this run was trained with.
+    # Includes model_type and training_mode so downstream tools (eval, export)
+    # know which architecture to instantiate.
     run_config = {
+        "model_type": args.model_type,
+        "training_mode": args.training_mode,
         "vae_checkpoint": str(Path(args.vae_checkpoint).resolve()),
         "vae_config": vae_cfg,
         "data_path": args.data_path,
         "hidden_size": args.hidden_size,
         "action_dim": args.action_dim,
+        "deter_dim": args.deter_dim,
+        "stoch_dim": args.stoch_dim,
         "seq_len": args.seq_len,
         "frame_stack": args.frame_stack,
         "lr": args.lr,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
         "grad_clip": args.grad_clip,
+        "rollout_k": args.rollout_k,
+        "multi_step_weight": args.multi_step_weight,
+        "kl_weight": args.kl_weight,
         "sampling_start": args.sampling_start,
         "sampling_end": args.sampling_end,
         "sampling_warmup_frac": args.sampling_warmup_frac,
@@ -168,19 +274,35 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
 
-    # Model
-    dynamics = LatentDynamicsModel(
-        latent_dim=latent_dim,
-        action_dim=args.action_dim,
-        hidden_size=args.hidden_size,
-    ).to(args.device)
+    # --- Model construction: dispatch on --model-type ---
+    if args.model_type == "gru":
+        dynamics = LatentDynamicsModel(
+            latent_dim=latent_dim,
+            action_dim=args.action_dim,
+            hidden_size=args.hidden_size,
+        ).to(args.device)
+        model_label = "LatentDynamicsModel (GRU)"
+    elif args.model_type == "rssm":
+        dynamics = LatentRSSM(
+            latent_dim=latent_dim,
+            action_dim=args.action_dim,
+            deter_dim=args.deter_dim,
+            stoch_dim=args.stoch_dim,
+            hidden_dim=args.hidden_size,
+        ).to(args.device)
+        model_label = "LatentRSSM"
+    else:
+        # Should be unreachable due to argparse choices, but be safe
+        raise ValueError(f"Unknown model type: {args.model_type}")
 
     param_count = sum(p.numel() for p in dynamics.parameters())
-    print(f"LatentDynamicsModel: {param_count:,} parameters")
+    print(f"{model_label}: {param_count:,} parameters")
+    print(f"  training_mode={args.training_mode}, rollout_k={args.rollout_k}, "
+          f"kl_weight={args.kl_weight}, ms_weight={args.multi_step_weight}")
 
     optimizer = torch.optim.Adam(dynamics.parameters(), lr=args.lr)
 
-    # LR scheduler (optional — only if --lr-patience > 0)
+    # LR scheduler (optional -- only if --lr-patience > 0)
     scheduler = None
     if args.lr_patience > 0:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -192,44 +314,99 @@ def main():
 
     writer = SummaryWriter(log_dir=str(dyn_dir / "tb"))
 
+    # Config dict stored in checkpoints -- includes model_type and training_mode
+    # so we can reconstruct the correct architecture at load time
     config = {
+        "model_type": args.model_type,
+        "training_mode": args.training_mode,
         "hidden_size": args.hidden_size,
         "action_dim": args.action_dim,
+        "deter_dim": args.deter_dim,
+        "stoch_dim": args.stoch_dim,
         "seq_len": args.seq_len,
         "frame_stack": args.frame_stack,
         "lr": args.lr,
         "batch_size": args.batch_size,
+        "rollout_k": args.rollout_k,
+        "multi_step_weight": args.multi_step_weight,
+        "kl_weight": args.kl_weight,
         "vae_checkpoint": args.vae_checkpoint,
     }
 
-    # Get a sample for DreamGridCallback
-    sample_frames, sample_actions = next(iter(val_loader))
-    # Use first episode, first frame as seed, first few actions
-    sample_seed = sample_frames[0:1, 0]  # (1, C, H, W)
-    sample_act = sample_actions[0:1, :min(10, sample_actions.size(1))]  # (1, T, action_dim)
+    # --- Select a few val episodes for detailed per-episode callbacks ---
+    # These callbacks (KinematicsValidation, DreamComparisonVideo, RSSMDiagnostic)
+    # need raw npz file paths, not DataLoader batches.
+    detail_paths = _collect_val_episode_paths(args.data_path, n_detail=5)
+    if detail_paths:
+        print(f"  Selected {len(detail_paths)} val episodes for detailed callbacks")
 
+    # --- Construct callbacks ---
     callbacks = [
+        # Core validation + early stopping -- uses the same loss function as
+        # the training loop so val loss is directly comparable
         PixelDynamicsValidationCallback(
             val_loader=val_loader, vae=vae,
             every_n_steps=args.val_every, patience=args.patience,
             checkpoint_dir=ckpt_dir,
+            training_mode=args.training_mode,
+            rollout_k=args.rollout_k,
+            kl_weight=args.kl_weight,
         ),
         CheckpointCallback(checkpoint_dir=ckpt_dir, every_n_steps=args.ckpt_every),
-        DreamGridCallback(vae=vae, sample_frames=sample_seed,
-                          sample_actions=sample_act, every_n_steps=args.val_every * 2),
+        # DreamGridCallback now takes val_dataset for random episode sampling
+        DreamGridCallback(vae=vae, val_dataset=val_ds,
+                          every_n_steps=args.val_every * 2),
         GradNormCallback(every_n_steps=50),
         NaNDetectionCallback(),
         ProgressCallback(every_n_steps=100, total_epochs=args.epochs),
     ]
 
+    # Kinematics validation -- only fires if VAE has a state head (state_dim > 0).
+    # The callback no-ops silently otherwise, so we wire it unconditionally.
+    if detail_paths:
+        callbacks.append(KinematicsValidationCallback(
+            vae=vae,
+            episode_paths=detail_paths,
+            every_n_steps=args.val_every * 4,
+            frame_size=frame_size,
+        ))
+
+    # Dream comparison video -- exports GT|Dream side-by-side MP4s for
+    # qualitative evaluation of dream quality over training
+    if detail_paths:
+        video_dir = str(dyn_dir / "dream_videos")
+        callbacks.append(DreamComparisonVideoCallback(
+            vae=vae,
+            episode_paths=detail_paths,
+            video_dir=video_dir,
+            every_n_steps=args.val_every * 10,
+            frame_size=frame_size,
+        ))
+
+    # RSSM diagnostics -- tracks KL divergence, prior vs posterior MSE.
+    # No-ops for GRU models, so we wire it unconditionally when we have
+    # episode paths available.
+    if detail_paths:
+        callbacks.append(RSSMDiagnosticCallback(
+            dynamics=dynamics,
+            episode_paths=detail_paths,
+            vae=vae,
+            every_n_steps=args.val_every * 4,
+            frame_size=frame_size,
+        ))
+
     ctx = CallbackContext(
         model=dynamics, optimizer=optimizer, writer=writer,
         global_step=0, epoch=0, run_dir=str(dyn_dir),
         device=args.device,
-        extras={"config": config, "vae_checkpoint": args.vae_checkpoint},
+        extras={
+            "config": config,
+            "vae_checkpoint": args.vae_checkpoint,
+            "model_type": args.model_type,
+        },
     )
 
-    # SIGINT handler
+    # SIGINT handler -- save an emergency checkpoint so training can resume
     interrupted = False
     def handle_sigint(sig, frame):
         nonlocal interrupted
@@ -251,7 +428,8 @@ def main():
     for cb in callbacks:
         cb.on_train_start(ctx)
 
-    print(f"\nTraining dynamics for {args.epochs} epochs on {args.device}")
+    print(f"\nTraining {model_label} ({args.training_mode}) "
+          f"for {args.epochs} epochs on {args.device}")
     for epoch in range(args.epochs):
         ctx.epoch = epoch
 
@@ -261,12 +439,17 @@ def main():
             args.sampling_warmup_frac,
         )
 
+        # Pass training_mode params so the loop dispatches to the right loss
         result = pixel_dynamics_train_epoch(
             dynamics, vae, train_loader, optimizer,
             sampling_prob=sampling_prob,
             device=args.device,
             max_grad_norm=args.grad_clip,
             ctx=ctx, callbacks=callbacks,
+            training_mode=args.training_mode,
+            rollout_k=args.rollout_k,
+            kl_weight=args.kl_weight,
+            ms_weight=args.multi_step_weight,
         )
 
         print(f"Epoch {epoch}: train_loss={result['train_loss']:.6f} "
