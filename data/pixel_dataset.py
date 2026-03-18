@@ -250,16 +250,27 @@ class PixelFrameDataset(Dataset):
               f"{f' + {self.state_dim}D states' if self._states is not None else ''}"
               f" from {len(episode_files)} episodes ({mb:.0f} MB in RAM)")
 
-        # Save cache — directory with separate .npy files (no compression,
-        # no memory copy). For 17 GB of frames, np.savez would OOM trying
-        # to compress; np.save writes directly without copying.
+        # Save cache, then free RAM and reload as mmap.
+        # np.save writes directly without copying. After saving, delete
+        # the in-memory arrays and reload as memory-mapped — OS pages
+        # from disk on demand, near-zero RAM.
         if cache_path is not None and n_total > 0:
             cache_dir = Path(cache_path)
             cache_dir.mkdir(parents=True, exist_ok=True)
-            np.save(str(cache_dir / "frames.npy"), self._frames)
+            frames_file = cache_dir / "frames.npy"
+            np.save(str(frames_file), self._frames)
+            states_file = cache_dir / "states.npy"
             if self._states is not None:
-                np.save(str(cache_dir / "states.npy"), self._states)
+                np.save(str(states_file), self._states)
             print(f"Saved cache to {cache_dir}")
+
+            # Free RAM and reload as mmap
+            del self._frames
+            self._frames = np.load(str(frames_file), mmap_mode='r')
+            if self._states is not None:
+                del self._states
+                self._states = np.load(str(states_file), mmap_mode='r')
+            print(f"Reloaded as mmap (RAM freed)")
 
     def __len__(self) -> int:
         return self._frames.shape[0]
