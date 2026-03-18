@@ -166,24 +166,25 @@ class PixelFrameDataset(Dataset):
         self._states = None  # (N, state_dim) float32 or None
 
         # Try loading from cache first.
-        # Cache is a single .npz with "frames" and optionally "states" arrays.
-        # The caller (training script) is responsible for encoding state_dim
-        # in the cache filename so different configs don't collide.
-        if cache_path is not None and Path(cache_path).exists():
-            print(f"Loading from cache: {cache_path} ...")
-            cached = np.load(str(cache_path))
-            self._frames = cached["frames"]
-            if state_dim > 0:
-                if "states" not in cached:
-                    raise ValueError(
-                        f"Cache at {cache_path} has no states, but state_dim={state_dim} requested. "
-                        f"Delete the cache and rerun, or use a different --cache-dir."
-                    )
-                self._states = cached["states"]
-            mb = self._frames.nbytes / 1024 / 1024
-            state_str = f" + {self._states.shape[1]}D states" if self._states is not None else ""
-            print(f"PixelFrameDataset: {self._frames.shape[0]} frames{state_str} ({mb:.0f} MB, from cache)")
-            return
+        # Cache is a directory with frames.npy and optionally states.npy.
+        # Uses uncompressed .npy to avoid memory doubling during save/load.
+        if cache_path is not None and Path(cache_path).is_dir():
+            frames_file = Path(cache_path) / "frames.npy"
+            if frames_file.exists():
+                print(f"Loading from cache: {cache_path} ...")
+                self._frames = np.load(str(frames_file))
+                states_file = Path(cache_path) / "states.npy"
+                if state_dim > 0:
+                    if not states_file.exists():
+                        raise ValueError(
+                            f"Cache at {cache_path} has no states.npy, but state_dim={state_dim}. "
+                            f"Delete the cache dir and rerun."
+                        )
+                    self._states = np.load(str(states_file))
+                mb = self._frames.nbytes / 1024 / 1024
+                state_str = f" + {self._states.shape[1]}D states" if self._states is not None else ""
+                print(f"PixelFrameDataset: {self._frames.shape[0]} frames{state_str} ({mb:.0f} MB, from cache)")
+                return
 
         # Normalize to list of paths
         if isinstance(data_path, (str, Path)):
@@ -240,14 +241,16 @@ class PixelFrameDataset(Dataset):
               f"{f' + {self.state_dim}D states' if self._states is not None else ''}"
               f" from {len(episode_files)} episodes ({mb:.0f} MB in RAM)")
 
-        # Save cache — single .npz with frames + optional states
+        # Save cache — directory with separate .npy files (no compression,
+        # no memory copy). For 17 GB of frames, np.savez would OOM trying
+        # to compress; np.save writes directly without copying.
         if cache_path is not None and n_total > 0:
-            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-            save_dict = {"frames": self._frames}
+            cache_dir = Path(cache_path)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            np.save(str(cache_dir / "frames.npy"), self._frames)
             if self._states is not None:
-                save_dict["states"] = self._states
-            np.savez(str(cache_path), **save_dict)
-            print(f"Saved cache to {cache_path}")
+                np.save(str(cache_dir / "states.npy"), self._states)
+            print(f"Saved cache to {cache_dir}")
 
     def __len__(self) -> int:
         return self._frames.shape[0]
