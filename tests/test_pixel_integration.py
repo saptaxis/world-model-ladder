@@ -4,7 +4,54 @@ import torch
 import pytest
 from models.pixel_vae import PixelVAE
 from models.pixel_dynamics import LatentDynamicsModel
+from models.pixel_rssm import LatentRSSM
 from models.pixel_world_model import PixelWorldModel
+from training.pixel_loop import pixel_dynamics_train_epoch
+
+
+# ---------------------------------------------------------------------------
+# End-to-end training integration tests
+# ---------------------------------------------------------------------------
+
+COMBOS = [
+    ("gru", "latent_mse", {}),
+    ("gru", "multi_step_latent", {"rollout_k": 3}),
+    ("rssm", "multi_step_latent", {"rollout_k": 3}),
+    ("rssm", "latent_elbo", {"rollout_k": 3, "kl_weight": 1.0}),
+]
+
+
+@pytest.mark.parametrize("model_type,training_mode,kwargs", COMBOS,
+                         ids=[f"{m}-{t}" for m, t, _ in COMBOS])
+def test_e2e_training_combo(model_type, training_mode, kwargs):
+    """End-to-end: train 2 steps with each valid (model, mode) combo."""
+    vae = PixelVAE(in_channels=1, latent_dim=8, frame_size=64, channels=[8, 16, 32, 64])
+    vae.eval()
+    for p in vae.parameters():
+        p.requires_grad_(False)
+
+    if model_type == "gru":
+        dynamics = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+    else:
+        dynamics = LatentRSSM(latent_dim=8, action_dim=2, deter_dim=16, stoch_dim=4, hidden_dim=16)
+
+    optimizer = torch.optim.Adam(dynamics.parameters(), lr=1e-3)
+    frames = torch.rand(2, 6, 1, 64, 64)
+    # latent_mse uses predict_sequence which expects T actions matching T frames;
+    # rollout-based modes expect T-1 actions (transitions between frames)
+    n_actions = 6 if training_mode == "latent_mse" else 5
+    actions = torch.randn(2, n_actions, 2)
+    # Two batches so we train for 2 steps
+    loader = [(frames, actions), (frames, actions)]
+
+    result = pixel_dynamics_train_epoch(
+        dynamics, vae, loader, optimizer,
+        training_mode=training_mode,
+        device="cpu",
+        **kwargs,
+    )
+    assert "train_loss" in result
+    assert result["train_loss"] > 0
 
 
 class TestPixelWorldModel:
