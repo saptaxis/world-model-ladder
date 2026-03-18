@@ -1,0 +1,221 @@
+#!/usr/bin/env python
+"""Generate dream comparison videos: GT vs model predictions.
+
+Produces MP4 videos with GT (left) and dream (right) side-by-side.
+Supports full autoregressive dreaming and periodic re-grounding
+(re-encode real frame every K steps).
+
+Usage:
+    # Full episodes + re-grounded at K=5,10,20
+    python scripts/dream_compare.py \
+        --vae-checkpoint /path/to/vae/best.pt \
+        --dynamics-checkpoint /path/to/dynamics/best.pt \
+        --data-path /path/to/episodes \
+        --output-dir ~/vsr-tmp/dreams \
+        --reground 5 10 20 0 \
+        --n-episodes 5 --policies heuristic random
+
+    # Just full dreams, no re-grounding
+    python scripts/dream_compare.py \
+        --vae-checkpoint /path/to/vae/best.pt \
+        --dynamics-checkpoint /path/to/dynamics/best.pt \
+        --data-path /path/to/episodes \
+        --output-dir ~/vsr-tmp/dreams \
+        --n-episodes 3
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import cv2
+import imageio
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from models.pixel_vae import PixelVAE
+from models.pixel_dynamics import LatentDynamicsModel
+from models.pixel_world_model import PixelWorldModel
+
+
+def load_pixel_world_model(vae_path: str, dyn_path: str,
+                           device: str) -> PixelWorldModel:
+    """Load trained PixelWorldModel from VAE + dynamics checkpoints."""
+    vae_ckpt = torch.load(vae_path, map_location=device, weights_only=False)
+    cfg = vae_ckpt["config"]
+    vae = PixelVAE(
+        in_channels=cfg["in_channels"],
+        latent_dim=cfg["latent_dim"],
+        frame_size=cfg["frame_size"],
+        channels=cfg.get("channels", [32, 64, 128, 256]),
+        state_dim=cfg.get("state_dim", 0),
+    )
+    vae.load_state_dict(vae_ckpt["model_state_dict"])
+
+    dyn_ckpt = torch.load(dyn_path, map_location=device, weights_only=False)
+    dyn_cfg = dyn_ckpt["config"]
+    dynamics = LatentDynamicsModel(
+        latent_dim=cfg["latent_dim"],
+        action_dim=dyn_cfg.get("action_dim", 2),
+        hidden_size=dyn_cfg.get("hidden_size", 256),
+    )
+    dynamics.load_state_dict(dyn_ckpt["model_state_dict"])
+
+    model = PixelWorldModel(vae, dynamics)
+    model.to(device)
+    model.eval()
+    return model, cfg
+
+
+def preprocess_episode(raw_frames: np.ndarray, frame_size: int,
+                       grayscale: bool = True) -> np.ndarray:
+    """Preprocess all frames from an episode. Returns (T+1, H, W) uint8."""
+    processed = []
+    for i in range(len(raw_frames)):
+        frame = raw_frames[i]
+        if grayscale and frame.ndim == 3 and frame.shape[2] == 3:
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        frame = cv2.resize(frame, (frame_size, frame_size),
+                           interpolation=cv2.INTER_AREA)
+        processed.append(frame)
+    return np.stack(processed)
+
+
+def dream_with_regrounding(model: PixelWorldModel, gt_frames: np.ndarray,
+                           actions: np.ndarray, reground_every: int
+                           ) -> np.ndarray:
+    """Dream with optional periodic re-encoding of real frames.
+
+    Args:
+        model: trained PixelWorldModel
+        gt_frames: (T+1, H, W) preprocessed uint8 frames
+        actions: (T, action_dim) float32 actions
+        reground_every: re-encode real frame every K steps (0 = no re-grounding)
+
+    Returns:
+        dreamed: (T+1, H, W) uint8 frames
+    """
+    n = len(actions)
+    dreamed = []
+
+    # Encode seed
+    seed_tensor = torch.from_numpy(gt_frames[0]).float().unsqueeze(0).unsqueeze(0) / 255.0
+    z = model.vae.encode(seed_tensor)
+    hidden = None
+
+    # First frame: decode seed
+    decoded = model.vae.decode(z).squeeze().detach().numpy()
+    dreamed.append((decoded * 255).clip(0, 255).astype(np.uint8))
+
+    for t in range(n):
+        action = torch.from_numpy(actions[t]).float().unsqueeze(0)
+
+        # Re-ground every K steps
+        if reground_every > 0 and t > 0 and t % reground_every == 0:
+            real_tensor = torch.from_numpy(gt_frames[t]).float().unsqueeze(0).unsqueeze(0) / 255.0
+            z = model.vae.encode(real_tensor)
+            hidden = None
+
+        with torch.no_grad():
+            z_next, hidden = model.dynamics(z, action, hidden)
+            frame = model.vae.decode(z_next).squeeze().detach().numpy()
+            z = z_next
+
+        dreamed.append((frame * 255).clip(0, 255).astype(np.uint8))
+
+    return np.stack(dreamed)
+
+
+def save_comparison_mp4(gt: np.ndarray, dreamed: np.ndarray,
+                        path: str, fps: int = 10):
+    """Save GT | Dream side-by-side MP4."""
+    T = min(len(gt), len(dreamed))
+    combined = np.concatenate([gt[:T], dreamed[:T]], axis=2)
+    frames_rgb = np.stack([combined] * 3, axis=-1)
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    writer = imageio.get_writer(path, fps=fps, codec="libx264",
+                                pixelformat="yuv420p",
+                                macro_block_size=1)
+    for f in frames_rgb:
+        writer.append_data(f)
+    writer.close()
+
+
+def find_episodes(data_path: str, policy: str, n_episodes: int) -> list[Path]:
+    """Find episode .npz files for a given policy subdirectory."""
+    policy_dir = Path(data_path) / policy
+    if not policy_dir.exists():
+        return []
+    files = sorted(policy_dir.glob("episode_*.npz"))
+    # Sample evenly across available episodes
+    if len(files) <= n_episodes:
+        return files
+    step = len(files) // n_episodes
+    return [files[i * step] for i in range(n_episodes)]
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate dream comparison videos")
+    parser.add_argument("--vae-checkpoint", type=str, required=True)
+    parser.add_argument("--dynamics-checkpoint", type=str, required=True)
+    parser.add_argument("--data-path", type=str, required=True,
+                        help="Directory with policy subdirs (heuristic/, random/)")
+    parser.add_argument("--output-dir", type=str, required=True)
+    parser.add_argument("--policies", type=str, nargs="+",
+                        default=["heuristic", "random"],
+                        help="Policy subdirectories to use")
+    parser.add_argument("--n-episodes", type=int, default=5,
+                        help="Number of episodes per policy")
+    parser.add_argument("--reground", type=int, nargs="+", default=[0],
+                        help="Re-grounding intervals. 0 = no re-grounding (full dream). "
+                             "Example: --reground 5 10 20 0")
+    parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--device", type=str, default="cpu")
+    args = parser.parse_args()
+
+    print(f"Loading model...")
+    model, vae_cfg = load_pixel_world_model(
+        args.vae_checkpoint, args.dynamics_checkpoint, args.device)
+    frame_size = vae_cfg["frame_size"]
+    grayscale = vae_cfg.get("in_channels", 1) == 1
+    print(f"  frame_size={frame_size}, grayscale={grayscale}")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    total_videos = 0
+    for policy in args.policies:
+        episodes = find_episodes(args.data_path, policy, args.n_episodes)
+        if not episodes:
+            print(f"No episodes found for policy '{policy}' in {args.data_path}")
+            continue
+
+        print(f"\n{policy}: {len(episodes)} episodes")
+        for ep_path in episodes:
+            ep_name = ep_path.stem  # e.g., episode_00010
+            data = np.load(str(ep_path), allow_pickle=True)
+            raw_frames = data["rgb_frames"]
+            actions = data["actions"]
+            n_steps = len(actions)
+
+            gt = preprocess_episode(raw_frames[:n_steps + 1], frame_size, grayscale)
+
+            for K in args.reground:
+                tag = f"k{K}" if K > 0 else "full_dream"
+                dreamed = dream_with_regrounding(model, gt, actions, reground_every=K)
+                fname = f"{policy}_{ep_name}_{n_steps}steps_{tag}.mp4"
+                save_comparison_mp4(gt, dreamed, str(out_dir / fname), fps=args.fps)
+                total_videos += 1
+
+            print(f"  {ep_name}: {n_steps} steps, {len(args.reground)} videos")
+
+    print(f"\nDone. {total_videos} videos saved to {out_dir}")
+
+
+if __name__ == "__main__":
+    main()
