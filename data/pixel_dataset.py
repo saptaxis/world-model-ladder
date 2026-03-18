@@ -167,12 +167,13 @@ class PixelFrameDataset(Dataset):
 
         # Try loading from cache first.
         # Cache is a directory with frames.npy and optionally states.npy.
-        # Uses uncompressed .npy to avoid memory doubling during save/load.
+        # Uses mmap_mode='r' — memory-mapped, no RAM allocation. OS pages
+        # data from disk on demand. DataLoader workers handle parallelism.
         if cache_path is not None and Path(cache_path).is_dir():
             frames_file = Path(cache_path) / "frames.npy"
             if frames_file.exists():
-                print(f"Loading from cache: {cache_path} ...")
-                self._frames = np.load(str(frames_file))
+                print(f"Loading from cache (mmap): {cache_path} ...")
+                self._frames = np.load(str(frames_file), mmap_mode='r')
                 states_file = Path(cache_path) / "states.npy"
                 if state_dim > 0:
                     if not states_file.exists():
@@ -180,10 +181,11 @@ class PixelFrameDataset(Dataset):
                             f"Cache at {cache_path} has no states.npy, but state_dim={state_dim}. "
                             f"Delete the cache dir and rerun."
                         )
-                    self._states = np.load(str(states_file))
-                mb = self._frames.nbytes / 1024 / 1024
+                    self._states = np.load(str(states_file), mmap_mode='r')
+                n = self._frames.shape[0]
+                disk_mb = os.path.getsize(str(frames_file)) / 1024 / 1024
                 state_str = f" + {self._states.shape[1]}D states" if self._states is not None else ""
-                print(f"PixelFrameDataset: {self._frames.shape[0]} frames{state_str} ({mb:.0f} MB, from cache)")
+                print(f"PixelFrameDataset: {n} frames{state_str} ({disk_mb:.0f} MB on disk, mmap)")
                 return
 
         # Normalize to list of paths
