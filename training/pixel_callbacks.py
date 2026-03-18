@@ -34,14 +34,17 @@ class PixelVAEValidationCallback(TrainCallback):
                  every_n_steps: int = 500, patience: int = 10,
                  checkpoint_dir: str | None = None):
         self.val_loader = val_loader
+        # Loss hyperparams must match training loop so val loss is comparable
         self.beta = beta
         self.fg_weight = fg_weight
         self.state_weight = state_weight
         self.every_n_steps = every_n_steps
+        # patience: number of val checks without improvement before stopping
         self.patience = patience
         self.checkpoint_dir = checkpoint_dir
         self.best_val_loss = float("inf")
         self.patience_counter = 0
+        # Guard against double-firing when a step aligns with multiple triggers
         self.last_val_step = -1
 
     def on_train_start(self, ctx: CallbackContext):
@@ -49,14 +52,17 @@ class PixelVAEValidationCallback(TrainCallback):
             Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
     def on_step(self, ctx: CallbackContext) -> bool:
+        # Skip step 0 — model hasn't seen any data yet
         if ctx.global_step == 0:
             return True
         if ctx.global_step % self.every_n_steps != 0:
             return True
+        # Prevent double-firing if multiple callbacks trigger at the same step
         if ctx.global_step == self.last_val_step:
             return True
         self.last_val_step = ctx.global_step
 
+        # Switch to eval mode for correct BatchNorm/Dropout behavior
         ctx.model.eval()
         total_loss = 0.0
         total_recon = 0.0
@@ -65,6 +71,7 @@ class PixelVAEValidationCallback(TrainCallback):
         n = 0
         with torch.no_grad():
             for batch in self.val_loader:
+                # Handle both frames-only and (frames, states) datasets
                 if isinstance(batch, torch.Tensor):
                     x = batch.to(ctx.device)
                     state_target = None
@@ -72,6 +79,8 @@ class PixelVAEValidationCallback(TrainCallback):
                     x = batch[0].to(ctx.device)
                     state_target = batch[1].to(ctx.device) if len(batch) > 1 else None
                 recon, mu, logvar, state_pred = ctx.model(x)
+                # Use same loss function and hyperparams as training
+                # so val loss is directly comparable to train loss
                 loss, recon_l, kl_l, state_l = vae_loss(
                     recon, x, mu, logvar, self.beta,
                     fg_weight=self.fg_weight,
@@ -82,22 +91,28 @@ class PixelVAEValidationCallback(TrainCallback):
                 total_kl += kl_l.item()
                 total_state += state_l.item()
                 n += 1
+        # Restore training mode for subsequent forward passes
         ctx.model.train()
 
         val_loss = total_loss / max(n, 1)
+        # Expose val_loss in extras so other callbacks can read it
         ctx.extras["val_loss"] = val_loss
 
         if ctx.writer:
+            # Log all loss components to TensorBoard for train/val comparison
             ctx.writer.add_scalar("val/loss", val_loss, ctx.global_step)
             ctx.writer.add_scalar("val/recon_loss", total_recon / max(n, 1), ctx.global_step)
             ctx.writer.add_scalar("val/kl_loss", total_kl / max(n, 1), ctx.global_step)
+            # Only log state loss when active — avoids cluttering TB with zeros
             if self.state_weight > 0:
                 ctx.writer.add_scalar("val/state_loss", total_state / max(n, 1), ctx.global_step)
 
         if val_loss < self.best_val_loss:
+            # New best — save checkpoint and reset patience counter
             self.best_val_loss = val_loss
             self.patience_counter = 0
             if self.checkpoint_dir:
+                # Save full training state for resumption, plus config for reproducibility
                 torch.save({
                     "model_state_dict": ctx.model.state_dict(),
                     "optimizer_state_dict": ctx.optimizer.state_dict(),
@@ -109,6 +124,7 @@ class PixelVAEValidationCallback(TrainCallback):
         else:
             self.patience_counter += 1
 
+        # Early stopping — return False to signal the training loop to break
         if self.patience_counter >= self.patience:
             print(f"Early stopping at step {ctx.global_step} "
                   f"(patience {self.patience}, best={self.best_val_loss:.6f})")
@@ -130,10 +146,12 @@ class ReconGridCallback(TrainCallback):
         if ctx.writer is None:
             return True
 
-        # Sample random frames from val dataset
+        # Sample random frames from val dataset — random sampling each firing
+        # shows different frames for qualitative diversity across training
         dataset = self.val_loader.dataset
         indices = torch.randperm(len(dataset))[:8]
         frames = [dataset[i] for i in indices]
+        # Handle both frames-only and (frames, states) datasets
         if isinstance(frames[0], tuple):
             frames = [f[0] for f in frames]
         x = torch.stack(frames).to(ctx.device)
@@ -141,12 +159,15 @@ class ReconGridCallback(TrainCallback):
         ctx.model.eval()
         with torch.no_grad():
             recon, _, _, _ = ctx.model(x)
+            # Interleave original and reconstruction: [orig1, recon1, orig2, recon2, ...]
+            # nrow=2 puts each orig-recon pair side by side in the grid
             pairs = torch.stack([x, recon], dim=1).reshape(-1, *x.shape[1:])
             try:
                 from torchvision.utils import make_grid
                 grid = make_grid(pairs, nrow=2, normalize=False)
                 ctx.writer.add_image("vae/recon_grid", grid, ctx.global_step)
             except ImportError:
+                # torchvision not installed — silently skip grid logging
                 pass
         ctx.model.train()
         return True
@@ -209,10 +230,12 @@ class PixelDynamicsValidationCallback(TrainCallback):
             return latent_dynamics_loss(z_pred[:, :-1], z_seq[:, 1:])
 
     def on_step(self, ctx) -> bool:
+        # Skip step 0 — no data seen yet
         if ctx.global_step == 0:
             return True
         if ctx.global_step % self.every_n_steps != 0:
             return True
+        # Prevent double-firing within the same step
         if ctx.global_step == self.last_val_step:
             return True
         self.last_val_step = ctx.global_step
@@ -222,9 +245,11 @@ class PixelDynamicsValidationCallback(TrainCallback):
         n = 0
         with torch.no_grad():
             for frames_batch, actions_batch in self.val_loader:
+                # Flatten frames for batch VAE encoding — same reshape as training loop
                 B, T, C, H, W = frames_batch.shape
                 frames_flat = frames_batch.reshape(B * T, C, H, W).to(ctx.device)
                 actions = actions_batch.to(ctx.device)
+                # Encode with frozen VAE — must match training loop encoding
                 z_all = self.vae.encode(frames_flat)
                 latent_dim = z_all.shape[-1]
                 z_seq = z_all.reshape(B, T, latent_dim)
@@ -241,9 +266,13 @@ class PixelDynamicsValidationCallback(TrainCallback):
             ctx.writer.add_scalar("val/loss", val_loss, ctx.global_step)
 
         if val_loss < self.best_val_loss:
+            # New best — save checkpoint and reset patience
             self.best_val_loss = val_loss
             self.patience_counter = 0
             if self.checkpoint_dir:
+                # Save full training state plus metadata needed to reload:
+                # vae_checkpoint path so we know which VAE to pair with,
+                # model_type so loader knows GRU vs RSSM
                 torch.save({
                     "model_state_dict": ctx.model.state_dict(),
                     "optimizer_state_dict": ctx.optimizer.state_dict(),
@@ -259,6 +288,7 @@ class PixelDynamicsValidationCallback(TrainCallback):
         else:
             self.patience_counter += 1
 
+        # Early stopping — return False to signal training loop to break
         if self.patience_counter >= self.patience:
             print(f"Early stopping at step {ctx.global_step} "
                   f"(patience {self.patience}, best={self.best_val_loss:.6f})")
@@ -437,6 +467,7 @@ class KinematicsValidationCallback(TrainCallback):
                 self.episodes.append(_load_npz_episode(p, frame_size))
 
     def on_step(self, ctx: CallbackContext) -> bool:
+        # No-op when VAE has no state head — allows unconditional wiring
         if not self.active:
             return True
         if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
@@ -449,27 +480,30 @@ class KinematicsValidationCallback(TrainCallback):
         ctx.model.eval()
 
         with torch.no_grad():
-            # Accumulate squared errors per horizon per dim across episodes
-            # horizon -> list of (n_dims,) tensors
+            # Accumulate per-dim squared errors at each horizon across episodes.
+            # Separate lists per horizon because not all episodes are long enough
+            # for all horizons — we only include valid ones.
             errors: dict[int, list[torch.Tensor]] = {h: [] for h in self.horizons}
 
             for ep in self.episodes:
                 frames = ep["frames"].to(device)   # (T+1, 1, H, W)
                 actions = ep["actions"].to(device)  # (T, 2)
                 gt_states = ep["states"].to(device)  # (T+1, state_dim)
-                # Only use the first 6 kinematic dims
+                # Only use the first 6 kinematic dims: x, y, vx, vy, angle, ang_vel
                 gt_kin = gt_states[:, :6]
 
                 # Encode all GT frames to latent space
                 z_gt = self.vae.encode(frames)  # (T+1, latent_dim)
 
-                # Dream: rollout from z_0 using actions
+                # Dream: rollout from z_0 using actions — tests whether the
+                # dynamics model preserves physical state information over time
                 z_dream, _ = ctx.model.rollout(
                     z_gt[0:1], actions.unsqueeze(0)
                 )  # (1, T+1, latent_dim)
                 z_dream = z_dream.squeeze(0)  # (T+1, latent_dim)
 
-                # Predict kinematic state from dreamed latents
+                # Predict kinematic state from dreamed latents — uses the VAE's
+                # auxiliary state head to decode z back to physical quantities
                 pred_kin = self.vae.predict_state(z_dream)  # (T+1, state_dim)
                 if pred_kin is None:
                     continue
@@ -478,11 +512,14 @@ class KinematicsValidationCallback(TrainCallback):
                 T_actions = actions.shape[0]
                 for h in self.horizons:
                     if h <= T_actions:
-                        # Per-dim squared error at horizon h
+                        # Per-dim squared error at horizon h — measures how
+                        # accurately the dream preserves each kinematic quantity
                         err = (pred_kin[h] - gt_kin[h]).pow(2)  # (6,)
                         errors[h].append(err)
 
-            # Log mean per-dim MSE at each horizon
+            # Log mean per-dim MSE at each horizon — e.g. kinematics/mse_h5_x
+            # tracks x-position error 5 steps into a dream. This reveals which
+            # kinematic dimensions degrade fastest during rollout.
             for h in self.horizons:
                 if not errors[h]:
                     continue
@@ -540,6 +577,7 @@ class DreamComparisonVideoCallback(TrainCallback):
         self.vae.eval()
         ctx.model.eval()
 
+        # Organise videos by training step for easy comparison across training
         step_dir = Path(self.video_dir) / f"step_{ctx.global_step}"
         step_dir.mkdir(parents=True, exist_ok=True)
 
@@ -547,18 +585,24 @@ class DreamComparisonVideoCallback(TrainCallback):
             for ep_idx, ep in enumerate(self.episodes):
                 frames = ep["frames"].to(device)
                 actions = ep["actions"].to(device)
+                # source_label (e.g. "heuristic", "primitive_hover") used in
+                # the filename so you can tell which episode type each video shows
                 label = ep["source_label"]
 
-                # Encode GT frames
+                # Encode GT frames to latent space
                 z_gt = self.vae.encode(frames)
 
-                # Dream from z_0
+                # Dream from z_0 — full autoregressive rollout using only actions.
+                # This is the prior-only path, showing what the model predicts
+                # without any future observations.
                 z_dream, _ = ctx.model.rollout(
                     z_gt[0:1], actions.unsqueeze(0)
                 )
                 z_dream = z_dream.squeeze(0)
 
                 # Decode both GT latents and dreamed latents to pixel space
+                # for visual comparison — GT shows what VAE reconstruction
+                # looks like, dream shows accumulated prediction error
                 gt_decoded = self.vae.decode(z_gt)    # (T+1, 1, H, W)
                 dream_decoded = self.vae.decode(z_dream)  # (T+1, 1, H, W)
 
@@ -570,13 +614,14 @@ class DreamComparisonVideoCallback(TrainCallback):
                     0, 255
                 ).astype(np.uint8)
 
-                # Side-by-side: GT on left, Dream on right
+                # Side-by-side: GT on left, Dream on right — makes divergence
+                # between dream and reality immediately visible
                 T = gt_np.shape[0]
                 combined = np.concatenate(
                     [gt_np[:T], dream_np[:T]], axis=2
                 )  # (T, H, 2*W)
 
-                # Save as MP4 -- convert grayscale to RGB for codec compat
+                # Save as MP4 — filename includes source label for identification
                 video_path = str(step_dir / f"{label}_{ep_idx}.mp4")
                 self._save_mp4(combined, video_path)
 
@@ -627,30 +672,40 @@ class RSSMDiagnosticCallback(TrainCallback):
         frame_size: int = 64,
     ):
         from models.pixel_rssm import LatentRSSM
+        # Type-check at init — silently no-ops for GRU dynamics so this
+        # callback can be unconditionally wired into the callback list
         self.is_rssm = isinstance(dynamics, LatentRSSM)
         self.every_n_steps = every_n_steps
         self.vae = vae
         self.frame_size = frame_size
 
-        # Pre-load episodes for validation-time diagnostics
+        # Pre-load episodes at init so on_step has no I/O — only loaded
+        # for RSSM since GRU skips all diagnostic work
         self.episodes: list[dict] = []
         if self.is_rssm:
             for p in episode_paths:
                 self.episodes.append(_load_npz_episode(p, frame_size))
 
     def on_step(self, ctx: CallbackContext) -> bool:
+        # No-op for GRU dynamics — allows unconditional wiring
         if not self.is_rssm:
             return True
 
         # --- Per-step cheap metrics from ctx.extras ---
+        # These are computed by the training loop already, so reading them
+        # here adds zero compute cost — just TensorBoard logging.
         if ctx.writer and ctx.global_step > 0:
-            # The training loop stores kl_loss when in ELBO mode
+            # KL divergence per step — tracks posterior collapse (KL -> 0 means
+            # the posterior isn't using observations) and KL explosion
             kl = ctx.extras.get("kl_loss")
             if kl is not None:
                 val = kl if isinstance(kl, float) else kl.item()
                 ctx.writer.add_scalar("rssm/kl_per_step", val, ctx.global_step)
 
-            # L2 between prior and posterior means
+            # L2 between prior and posterior means — measures how much the
+            # posterior corrects the prior. If near zero, the posterior isn't
+            # learning anything from observations (collapsed); if very large,
+            # prior and posterior disagree strongly (dreaming will be poor).
             pp_div = ctx.extras.get("prior_post_div")
             if pp_div is not None:
                 val = pp_div if isinstance(pp_div, float) else pp_div.item()
@@ -659,6 +714,8 @@ class RSSMDiagnosticCallback(TrainCallback):
                 )
 
         # --- Periodic validation-time diagnostics ---
+        # These require forward passes and are more expensive, so they run
+        # at a lower frequency (every_n_steps, typically 2000)
         if ctx.global_step == 0 or ctx.global_step % self.every_n_steps != 0:
             return True
         if ctx.writer is None:
@@ -677,6 +734,8 @@ class RSSMDiagnosticCallback(TrainCallback):
                 frames = ep["frames"].to(device)
                 actions = ep["actions"].to(device)
                 T = actions.shape[0]
+                # Skip very short episodes — need at least 2 transitions
+                # for meaningful prior/posterior comparison
                 if T < 2:
                     continue
 
@@ -684,6 +743,8 @@ class RSSMDiagnosticCallback(TrainCallback):
                 z_gt = self.vae.encode(frames)  # (T+1, latent_dim)
 
                 # --- Prior MSE: dream with rollout() (prior only) ---
+                # rollout() uses imagine_step() internally — no observations.
+                # This is the quality the model achieves at test time.
                 z_prior, _ = ctx.model.rollout(
                     z_gt[0:1], actions.unsqueeze(0)
                 )  # (1, T+1, latent_dim)
@@ -692,6 +753,9 @@ class RSSMDiagnosticCallback(TrainCallback):
                 prior_mse_sum += prior_mse
 
                 # --- Posterior MSE: step through with model.step() ---
+                # step() uses the posterior — it observes each GT z_t before
+                # predicting z_{t+1}. This should always be lower than prior MSE;
+                # if the gap is small, the posterior isn't helping much.
                 state = None
                 post_preds = []
                 for t in range(T):
@@ -710,11 +774,14 @@ class RSSMDiagnosticCallback(TrainCallback):
         ctx.model.train()
 
         if n_episodes > 0 and ctx.writer:
+            # prior_mse: dream quality (test-time performance)
             ctx.writer.add_scalar(
                 "rssm/prior_mse",
                 prior_mse_sum / n_episodes,
                 ctx.global_step,
             )
+            # posterior_mse: observation-guided prediction quality (training upper bound)
+            # Gap between prior and posterior MSE indicates room for improvement
             ctx.writer.add_scalar(
                 "rssm/posterior_mse",
                 posterior_mse_sum / n_episodes,

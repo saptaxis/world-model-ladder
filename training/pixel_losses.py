@@ -30,8 +30,11 @@ def _foreground_weight_mask(target: torch.Tensor, fg_weight: float,
     Returns:
         (B, C, H, W) weight tensor, same shape as target
     """
-    # Foreground: pixels with intensity in (lo, hi)
+    # Foreground: pixels with intensity in (lo, hi) — the lander, legs,
+    # flames, and flags sit in this band. Sky is near-black (< lo) and
+    # terrain is near-white (> hi), both easy for the VAE to reconstruct.
     fg_mask = (target > lo) & (target < hi)
+    # Start with uniform weight 1; only upweight foreground pixels
     weights = torch.ones_like(target)
     weights[fg_mask] = fg_weight
     return weights
@@ -70,18 +73,33 @@ def vae_loss(recon: torch.Tensor, target: torch.Tensor,
         total_loss, recon_loss, kl_loss, state_loss (all scalar tensors)
     """
     if fg_weight > 1.0:
+        # Foreground-weighted MSE — upweight lander/flames/flags pixels so the
+        # VAE allocates capacity to small, visually important objects instead
+        # of spending it all on the easy-to-reconstruct sky and terrain
         weights = _foreground_weight_mask(target, fg_weight)
         recon_loss = (weights * (recon - target).pow(2)).mean()
     else:
+        # Uniform MSE — default when no foreground weighting is requested
         recon_loss = F.mse_loss(recon, target)
 
+    # KL divergence D_KL(q(z|x) || N(0,I)) — closed-form for diagonal Gaussian.
+    # Sum over latent dims per sample, then average over the batch.
+    # This regularises z to stay near the prior, preventing posterior collapse
+    # into a point estimate (which would make the latent non-smooth).
     kl_per_sample = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
     kl_loss = kl_per_sample.mean()
 
+    # Auxiliary state prediction loss — zero tensor when disabled so callers
+    # can always unpack the same 4-tuple without branching
     state_loss = torch.tensor(0.0, device=recon.device)
     if state_pred is not None and state_target is not None and state_weight > 0:
+        # MSE between VAE's state-head output and ground-truth kinematics.
+        # Forces the latent z to encode physical state (pos, vel, angle),
+        # giving z spatial meaning and preventing discontinuous jumps.
         state_loss = F.mse_loss(state_pred, state_target)
 
+    # Weighted sum — beta << 1 keeps KL from overwhelming reconstruction,
+    # state_weight is tuned per-experiment to balance grounding vs fidelity
     total = recon_loss + beta * kl_loss + state_weight * state_loss
     return total, recon_loss, kl_loss, state_loss
 

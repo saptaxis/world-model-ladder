@@ -36,10 +36,19 @@ def parse_args():
     p.add_argument("--data-path", type=str, nargs="+", required=True,
                    help="One or more directories with .npz episode files")
     p.add_argument("--run-dir", type=str, default="runs/pixel-vae")
+    # 84x84 matches the standard Atari/control benchmark resolution and is
+    # small enough that a 4-layer conv encoder reaches a 4x4 or 6x6 spatial
+    # bottleneck, keeping the VAE compact.
     p.add_argument("--frame-size", type=int, default=84)
     p.add_argument("--latent-dim", type=int, default=64)
     p.add_argument("--in-channels", type=int, default=1)
+    # 4-layer encoder: 32→64→128→256 channels.  Each layer halves spatial
+    # resolution, so 84→42→21→10→5 (approx) before flattening to latent.
     p.add_argument("--channels", type=int, nargs="+", default=[32, 64, 128, 256])
+    # beta=0.0001 is intentionally low — we prioritise sharp reconstructions
+    # over a smooth latent space. Dynamics training regularises the latent
+    # space downstream, so heavy KL pressure here would hurt pixel quality
+    # without benefit.
     p.add_argument("--beta", type=float, default=0.0001)
     p.add_argument("--fg-weight", type=float, default=1.0,
                    help="Foreground pixel weight in recon loss. >1 upweights lander/flames vs sky/terrain.")
@@ -52,10 +61,15 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--val-every", type=int, default=500)
+    # patience=10 val checks without improvement triggers early stop, which
+    # prevents overfitting the decoder to training-set textures.
     p.add_argument("--patience", type=int, default=10)
     p.add_argument("--ckpt-every", type=int, default=2000)
     p.add_argument("--device", type=str,
                    default="cuda" if torch.cuda.is_available() else "cpu")
+    # num-workers controls DataLoader prefetch parallelism (batch-level);
+    # load-workers controls the initial npz→numpy bulk load (episode-level).
+    # They serve different phases, so both are independently tunable.
     p.add_argument("--num-workers", type=int, default=4,
                    help="DataLoader workers for batch prefetching")
     p.add_argument("--load-workers", type=int, default=8,
@@ -68,6 +82,10 @@ def parse_args():
                    help="LR reduction factor when plateau detected")
     p.add_argument("--lr-min", type=float, default=1e-6,
                    help="Minimum LR for scheduler")
+    # Default to grayscale because LunarLander's colour information is
+    # mostly decorative (sky gradient, terrain shade) — grayscale preserves
+    # the structurally important edges (lander, legs, flames) at 1/3 the
+    # channel cost.
     p.add_argument("--grayscale", action="store_true", default=True)
     p.add_argument("--no-grayscale", dest="grayscale", action="store_false")
     return p.parse_args()
@@ -81,7 +99,9 @@ def main():
     vae_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = str(vae_dir)
 
-    # Data — use cache if available for instant loading
+    # --- Data loading ---
+    # Cache paths encode frame_size, grayscale, and state_dim so that
+    # different preprocessing configs don't collide in the same cache dir.
     cache_train = None
     cache_val = None
     if args.cache_dir:
@@ -106,12 +126,18 @@ def main():
     )
     print(f"  Train: {len(train_ds)} frames, Val: {len(val_ds)} frames")
 
+    # pin_memory=True pre-stages batch tensors in page-locked RAM so the
+    # GPU DMA transfer is faster. shuffle=True for training, False for val
+    # so val metrics are deterministic across runs.
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
 
-    # Model
+    # --- Model ---
+    # Resolve in_channels: default (1) auto-detects from grayscale flag,
+    # but an explicit --in-channels override takes priority (e.g., for
+    # frame-stacked inputs with multiple channels).
     grayscale_channels = 1 if args.grayscale else 3
     in_ch = args.in_channels if args.in_channels != 1 else grayscale_channels
     vae = PixelVAE(
@@ -128,6 +154,10 @@ def main():
 
     optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
 
+    # LR scheduler (optional) — ReduceLROnPlateau lowers the learning rate
+    # when val loss plateaus, which helps squeeze out final reconstruction
+    # quality. Disabled by default (lr_patience=0) because most runs
+    # converge fine with a fixed LR.
     scheduler = None
     if args.lr_patience > 0:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -162,8 +192,12 @@ def main():
         json.dump(config, f, indent=2)
     print(f"Config saved to {vae_dir / 'config.json'}")
 
-    # Callbacks
+    # --- Callbacks ---
+    # Order matters: validation first (updates best checkpoint + early stop
+    # flag), then periodic checkpoints, then diagnostics.
     callbacks = [
+        # Runs full val pass every val_every steps; saves best.pt and tracks
+        # patience for early stopping.
         PixelVAEValidationCallback(
             val_loader=val_loader, beta=args.beta,
             fg_weight=args.fg_weight,
@@ -171,9 +205,15 @@ def main():
             every_n_steps=args.val_every, patience=args.patience,
             checkpoint_dir=ckpt_dir,
         ),
+        # Periodic checkpoint (independent of best — for crash recovery)
         CheckpointCallback(checkpoint_dir=ckpt_dir, every_n_steps=args.ckpt_every),
+        # Logs a grid of input|reconstruction pairs to TensorBoard for
+        # visual inspection of VAE quality during training.
         ReconGridCallback(val_loader=val_loader, every_n_steps=args.val_every),
+        # Logs gradient norm to detect exploding/vanishing gradients
         GradNormCallback(every_n_steps=50),
+        # Halts training immediately if loss goes NaN — faster feedback
+        # than waiting for the epoch to finish with garbage gradients.
         NaNDetectionCallback(),
         ProgressCallback(every_n_steps=100, total_epochs=args.epochs),
     ]
@@ -185,7 +225,10 @@ def main():
         extras={"config": config},
     )
 
-    # SIGINT handler
+    # --- SIGINT handler ---
+    # Catch Ctrl-C to save an emergency checkpoint before exiting, so long
+    # training runs aren't completely lost. Second Ctrl-C force-exits
+    # immediately in case the save itself hangs.
     interrupted = False
 
     def handle_sigint(sig, frame):
@@ -225,9 +268,12 @@ def main():
         print(f"Epoch {epoch}: train_loss={result['train_loss']:.6f} "
               f"recon={result['recon_loss']:.6f} kl={result['kl_loss']:.6f}{state_str}")
 
+        # Log current LR so we can see scheduler reductions in TensorBoard
         if ctx.writer:
             ctx.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], ctx.global_step)
 
+        # Step the LR scheduler on val loss (set by the validation callback).
+        # Only fires when both the scheduler exists and a val pass has run.
         if scheduler is not None and "val_loss" in ctx.extras:
             scheduler.step(ctx.extras["val_loss"])
 

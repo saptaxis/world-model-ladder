@@ -46,6 +46,9 @@ class PixelVAE(nn.Module):
         self.frame_size = frame_size
         self.beta = beta
 
+        # Default channel progression doubles at each layer following the
+        # ArcadeDreamer convention — 32→64→128→256 gives 4x capacity growth
+        # that balances representation power against parameter count
         if channels is None:
             channels = [32, 64, 128, 256]
         self.channels = channels
@@ -68,7 +71,9 @@ class PixelVAE(nn.Module):
         self._spatial = spatial
         self._flat_dim = channels[-1] * spatial * spatial
 
-        # Latent projections
+        # Latent projections — separate heads for mu and logvar so the
+        # network can independently control the mean and uncertainty of
+        # each latent dimension
         self.fc_mu = nn.Linear(self._flat_dim, latent_dim)
         self.fc_logvar = nn.Linear(self._flat_dim, latent_dim)
 
@@ -87,15 +92,20 @@ class PixelVAE(nn.Module):
         self._dec_sizes.reverse()  # [5, 10, 21, 42, 84] for frame_size=84
 
         dec_layers = nn.ModuleList()
-        rev_channels = list(reversed(channels))
+        rev_channels = list(reversed(channels))  # [256, 128, 64, 32] — mirror encoder order
         for i in range(len(rev_channels) - 1):
+            # Each decoder block: upsample to the exact target spatial size,
+            # then refine with a conv layer. Using Upsample+Conv instead of
+            # ConvTranspose2d avoids checkerboard artifacts and guarantees
+            # exact spatial dimensions (critical for non-power-of-2 sizes like 84)
             dec_layers.append(nn.Sequential(
                 nn.Upsample(size=self._dec_sizes[i + 1], mode='bilinear', align_corners=False),
                 nn.Conv2d(rev_channels[i], rev_channels[i + 1],
                           kernel_size=3, stride=1, padding=1),
                 nn.ReLU(inplace=True),
             ))
-        # Final layer: upsample to frame_size, conv back to in_channels, sigmoid
+        # Final layer: upsample to original frame_size, project to input
+        # channels, sigmoid clamps output to [0,1] matching normalized pixel range
         dec_layers.append(nn.Sequential(
             nn.Upsample(size=frame_size, mode='bilinear', align_corners=False),
             nn.Conv2d(rev_channels[-1], in_channels,
@@ -104,7 +114,12 @@ class PixelVAE(nn.Module):
         ))
         self.decoder_layers = dec_layers
 
-        # Optional auxiliary state prediction head
+        # Optional auxiliary state prediction head — forces the latent space
+        # to encode physical state (position, velocity, angle) by adding a
+        # supervised regression loss. Small hidden layer (64) is intentional:
+        # the mapping from a well-structured z to kinematic state should be
+        # near-linear, so a small head avoids overfitting while still providing
+        # gradient signal to shape the latent space
         self.state_dim = state_dim
         if state_dim > 0:
             self.state_head = nn.Sequential(
@@ -124,15 +139,22 @@ class PixelVAE(nn.Module):
     def encode_params(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode frames to (mu, logvar) parameters."""
         h = self.encoder_conv(x)
+        # Flatten spatial dims: (B, C_last, S, S) -> (B, C_last * S * S)
+        # so the linear projection can map to latent_dim
         h = h.reshape(h.size(0), -1)
         return self.fc_mu(h), self.fc_logvar(h)
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         """Sample z using reparameterization trick."""
         if self.training:
+            # exp(0.5 * logvar) = sqrt(var) = std; log-space parameterisation
+            # ensures std is always positive without constrained optimisation
             std = torch.exp(0.5 * logvar)
+            # Reparameterization: z = mu + std * eps allows gradients to flow
+            # through mu and std while eps ~ N(0,1) provides stochasticity
             eps = torch.randn_like(std)
             return mu + std * eps
+        # At eval, return the mode (mu) for deterministic predictions
         return mu
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
@@ -143,6 +165,8 @@ class PixelVAE(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         """Decode latent z to reconstructed frames."""
         h = self.fc_decode(z)
+        # Reshape flat vector back to spatial feature map: (B, flat_dim) ->
+        # (B, last_enc_channels, spatial, spatial) to feed into conv decoder
         h = h.reshape(h.size(0), self.channels[-1], self._spatial, self._spatial)
         for layer in self.decoder_layers:
             h = layer(h)

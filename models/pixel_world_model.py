@@ -29,10 +29,14 @@ class PixelWorldModel(nn.Module):
 
     def encode(self, frames: torch.Tensor) -> torch.Tensor:
         """Encode frames to latent z (deterministic — returns mu)."""
+        # Temporarily switch to eval mode so encode() returns mu (deterministic)
+        # rather than a stochastic sample — we want consistent latent codes
+        # when encoding observations for dynamics training or dreaming
         was_training = self.vae.training
         self.vae.eval()
         with torch.no_grad():
             z = self.vae.encode(frames)
+        # Restore original training mode to avoid side effects on the VAE
         self.vae.train(was_training)
         return z
 
@@ -44,8 +48,12 @@ class PixelWorldModel(nn.Module):
                      hidden: torch.Tensor | None = None
                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Teacher-forced single-step: encode real frame, predict next, decode."""
+        # Encode with training mode active — stochastic sampling during training
+        # acts as regularisation for the dynamics model
         z = self.vae.encode(frames)
+        # Dynamics predicts next latent from current latent + action
         z_next, hidden = self.dynamics(z, action, hidden)
+        # Decode back to pixel space for reconstruction loss or visualisation
         pred_frame = self.vae.decode(z_next)
         return pred_frame, z_next, hidden
 
@@ -67,13 +75,21 @@ class PixelWorldModel(nn.Module):
         T = actions.size(1)
 
         if C == 1:
+            # Single-frame mode: pure latent-space rollout is efficient —
+            # encode once, rollout in latent space, batch-decode all at once
             z = self.vae.encode(seed_frames)
             z_seq, _ = self.dynamics.rollout(z, actions)
+            # Batch-decode all T+1 latents at once for GPU efficiency
             all_z = z_seq.reshape(B * (T + 1), -1)
             all_frames = self.vae.decode(all_z)
             frames = all_frames.reshape(B, T + 1, 1, H, W)
         else:
+            # Stacked-frame mode (C>1): cannot do pure latent rollout because
+            # the encoder expects C stacked channels. Instead, maintain a
+            # sliding buffer of individual frames, decode each predicted
+            # frame, push it into the buffer, and re-encode the new stack.
             frame_stack = C
+            # Split seed (B, C, H, W) into C individual (B, 1, H, W) frames
             buffer = list(seed_frames.split(1, dim=1))
 
             z = self.vae.encode(seed_frames)
@@ -82,12 +98,18 @@ class PixelWorldModel(nn.Module):
 
             for t in range(T):
                 z_next, hidden = self.dynamics(z, actions[:, t], hidden)
+                # Decode to pixels, take only channel 0 — the decoder outputs
+                # C channels but we only need the newest single frame prediction
                 pred_single = self.vae.decode(z_next)[:, :1]
+                # Slide the buffer: drop oldest frame, append newest prediction
                 buffer = buffer[1:] + [pred_single]
+                # Re-stack and re-encode so the next dynamics step sees the
+                # updated frame history, maintaining temporal context
                 stacked = torch.cat(buffer, dim=1)
                 all_frames.append(stacked)
                 z = self.vae.encode(stacked)
 
+            # Stack along time: (B, T+1, C, H, W)
             frames = torch.stack(all_frames, dim=1)
 
         self.train(was_training)
@@ -96,14 +118,22 @@ class PixelWorldModel(nn.Module):
     @torch.no_grad()
     def dream_from_latent(self, z_seed: torch.Tensor, actions: torch.Tensor
                           ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dream from a latent seed (pure latent-space rollout)."""
+        """Dream from a latent seed (pure latent-space rollout).
+
+        Unlike dream(), this skips the initial encode step — useful when
+        the caller already has a latent code (e.g., from a training batch).
+        """
         was_training = self.training
         self.eval()
 
+        # Pure latent rollout — no encode/decode in the loop
         z_seq, _ = self.dynamics.rollout(z_seed, actions)
+        # Batch-decode all timesteps at once: flatten (B, T+1) into a
+        # single batch dimension for efficient GPU parallelism
         B, Tp1, D = z_seq.shape
         all_z = z_seq.reshape(B * Tp1, D)
         all_frames = self.vae.decode(all_z)
+        # Reshape back to (B, T+1, C, H, W) video tensor
         C, H, W = all_frames.shape[1:]
         frames = all_frames.reshape(B, Tp1, C, H, W)
 

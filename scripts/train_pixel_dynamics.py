@@ -70,6 +70,8 @@ VALID_COMBOS = {
 
 def load_vae(checkpoint_path: str, device: str) -> PixelVAE:
     """Load VAE from checkpoint, extracting config to recreate architecture."""
+    # weights_only=False because we stored config as a plain dict alongside
+    # the state_dict — torch.load needs to unpickle it.
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
     vae = PixelVAE(
@@ -81,6 +83,9 @@ def load_vae(checkpoint_path: str, device: str) -> PixelVAE:
     )
     vae.load_state_dict(ckpt["model_state_dict"])
     vae.to(device)
+    # Freeze the VAE entirely — Phase 2 only trains the dynamics model.
+    # eval() disables dropout/batchnorm updates; requires_grad_(False)
+    # excludes VAE params from the optimizer and saves backward-pass memory.
     vae.eval()
     for p in vae.parameters():
         p.requires_grad_(False)
@@ -89,7 +94,13 @@ def load_vae(checkpoint_path: str, device: str) -> PixelVAE:
 
 def get_sampling_prob(epoch: int, total_epochs: int,
                       start: float, end: float, warmup_frac: float) -> float:
-    """Linear annealing of scheduled sampling probability."""
+    """Linear annealing of scheduled sampling probability.
+
+    During warmup, use only teacher forcing (sampling_prob = start, typically 0).
+    After warmup, linearly increase to `end` — this gradually forces the
+    dynamics model to consume its own predictions rather than ground-truth
+    latents, reducing the train/dream distribution gap.
+    """
     warmup_epochs = int(total_epochs * warmup_frac)
     if epoch < warmup_epochs:
         return start
@@ -115,13 +126,17 @@ def _collect_val_episode_paths(data_paths: list[str], n_detail: int = 5) -> list
     if not all_npz:
         return []
 
-    # Mirror the 90/10 train/val split from PixelEpisodeDataset (seed=0)
+    # Mirror the 90/10 train/val split from PixelEpisodeDataset (seed=0).
+    # Must use the same RNG + seed so we pick episodes that are actually
+    # in the validation set — otherwise we'd leak training data into the
+    # per-episode diagnostic callbacks.
     rng = np.random.RandomState(0)
     n_val = max(1, int(len(all_npz) * 0.1))
     val_indices = rng.permutation(len(all_npz))[:n_val]
     val_episode_paths = [str(all_npz[i]) for i in sorted(val_indices)]
 
-    # Return a manageable subset for per-episode callbacks
+    # Return a manageable subset — running detailed callbacks (dream videos,
+    # kinematics plots) on all val episodes would be too slow.
     return val_episode_paths[:min(n_detail, len(val_episode_paths))]
 
 
@@ -201,7 +216,11 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Load frozen VAE
+    # --- Load frozen VAE ---
+    # The VAE was trained in Phase 1 (train_pixel_vae.py). We load it frozen
+    # to provide encode/decode for the dynamics model. Extracting frame_size,
+    # latent_dim, and grayscale from the VAE config ensures consistency
+    # between phases — no risk of a mismatch if the user forgets a flag.
     print(f"Loading VAE from {args.vae_checkpoint} ...")
     vae = load_vae(args.vae_checkpoint, args.device)
     vae_ckpt = torch.load(args.vae_checkpoint, map_location=args.device, weights_only=False)
@@ -269,6 +288,9 @@ def main():
     )
     print(f"  Train: {len(train_ds)} windows, Val: {len(val_ds)} windows")
 
+    # shuffle=True for training ensures the model sees windows from different
+    # episodes in each batch — prevents temporal correlation within batches
+    # that could bias gradient estimates.
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,

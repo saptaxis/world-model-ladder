@@ -24,8 +24,14 @@ from tqdm import tqdm
 def _preprocess_frame(frame: np.ndarray, frame_size: int,
                       grayscale: bool) -> np.ndarray:
     """Resize and optionally convert to grayscale. Returns (H, W) or (H, W, 3) uint8."""
+    # Convert before resize — grayscale reduces channels from 3→1, which
+    # means INTER_AREA downsampling operates on a single channel (faster
+    # and avoids colour-bleeding artefacts at small resolutions).
     if grayscale and frame.ndim == 3 and frame.shape[2] == 3:
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+    # INTER_AREA is the correct interpolation for downscaling — it averages
+    # pixel areas rather than point-sampling, avoiding aliasing artefacts
+    # that INTER_LINEAR or INTER_NEAREST would produce at 4-6x downscale.
     resized = cv2.resize(frame, (frame_size, frame_size),
                          interpolation=cv2.INTER_AREA)
     return resized
@@ -34,8 +40,12 @@ def _preprocess_frame(frame: np.ndarray, frame_size: int,
 def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
     """Convert preprocessed frame to (C, H, W) float32 tensor in [0, 1]."""
     if frame.ndim == 2:
+        # Grayscale (H, W) → (1, H, W): unsqueeze adds the channel dim
+        # that Conv2d expects. Divide by 255 to normalise uint8 → [0, 1].
         t = torch.from_numpy(frame).float().unsqueeze(0) / 255.0
     else:
+        # RGB (H, W, 3) → (3, H, W): permute from HWC (numpy/cv2 layout)
+        # to CHW (PyTorch conv layout).
         t = torch.from_numpy(frame).float().permute(2, 0, 1) / 255.0
     return t
 
@@ -43,30 +53,45 @@ def _frame_to_tensor(frame: np.ndarray) -> torch.Tensor:
 def _split_episodes(npz_files: list[Path], split: str | None,
                     val_fraction: float, seed: int) -> list[Path]:
     """Split episode files into train/val by episode."""
+    # Fixed-seed RNG so train/val splits are identical across runs — critical
+    # to avoid data leakage between VAE and dynamics training phases.
     rng = np.random.RandomState(seed)
     indices = rng.permutation(len(npz_files))
+    # At least 1 val episode even for tiny datasets, otherwise val metrics
+    # would be undefined.
     n_val = max(1, int(len(npz_files) * val_fraction))
     if split == "val":
+        # First n_val of the shuffled indices become validation
         selected = sorted(indices[:n_val])
     elif split == "train":
+        # Remaining indices become training
         selected = sorted(indices[n_val:])
     else:
+        # No split requested — return everything (used for inference/eval)
         selected = list(range(len(npz_files)))
     return [npz_files[i] for i in selected]
 
 
 def _load_one_episode(args: tuple) -> np.ndarray | None:
     """Load and preprocess a single episode's frames. For multiprocessing.Pool."""
+    # Takes a tuple (not kwargs) because multiprocessing.Pool.imap requires
+    # a single-argument callable — we pack/unpack manually.
     path, frame_size, grayscale = args
     try:
+        # np.load with context manager ensures the npz file handle is closed
+        # promptly, avoiding file-descriptor exhaustion with thousands of episodes.
         with np.load(str(path)) as data:
             raw_frames = data["rgb_frames"]
+        # Stack into a single (T+1, H, W) array — contiguous memory for
+        # efficient concatenation later in the parent process.
         processed = np.stack([
             _preprocess_frame(raw_frames[i], frame_size, grayscale)
             for i in range(len(raw_frames))
         ])
         return processed
     except Exception:
+        # Silently skip corrupt/truncated episodes rather than crashing —
+        # a few missing episodes won't affect training quality.
         return None
 
 
@@ -76,7 +101,10 @@ def _load_one_episode_states(args: tuple) -> tuple[np.ndarray | None, np.ndarray
     try:
         with np.load(str(path)) as data:
             raw_frames = data["rgb_frames"]
-            # States are (T+1, full_state_dim), slice to state_dim
+            # States in the npz are (T+1, full_state_dim) — the full 8D
+            # LunarLander state vector. We slice to state_dim (typically 6)
+            # to drop leg-contact booleans that aren't useful for the aux
+            # state prediction head. Cast to float32 for torch compatibility.
             states = data["states"][:, :state_dim].astype(np.float32) if "states" in data else None
         processed = np.stack([
             _preprocess_frame(raw_frames[i], frame_size, grayscale)
@@ -94,6 +122,9 @@ def _load_one_episode_with_actions(args: tuple) -> tuple[np.ndarray | None, np.n
         with np.load(str(path)) as data:
             raw_frames = data["rgb_frames"]
             actions = data["actions"].astype(np.float32)
+        # Episodes store T+1 frames and T actions (one action per transition).
+        # Some episodes may have mismatched counts due to early termination
+        # or recording bugs, so we clamp to the minimum usable length.
         n_frames = raw_frames.shape[0]
         n_actions = actions.shape[0]
         usable = min(n_frames, n_actions + 1)
@@ -101,6 +132,7 @@ def _load_one_episode_with_actions(args: tuple) -> tuple[np.ndarray | None, np.n
             _preprocess_frame(raw_frames[i], frame_size, grayscale)
             for i in range(usable)
         ])
+        # Return usable-1 actions to maintain the (T+1 frames, T actions) invariant.
         return processed, actions[:usable - 1]
     except Exception:
         return None, None
@@ -120,6 +152,9 @@ def _load_and_preprocess_all_frames(
     args = [(path, frame_size, grayscale) for path in episode_files]
 
     all_episodes = []
+    # imap (not imap_unordered) preserves episode order for deterministic
+    # dataset construction. The tqdm wrapper shows progress since loading
+    # thousands of npz files can take several minutes.
     with Pool(n_workers) as pool:
         for result in tqdm(
             pool.imap(_load_one_episode, args),
@@ -163,12 +198,14 @@ class PixelFrameDataset(Dataset):
         self.frame_size = frame_size
         self.grayscale = grayscale
         self.state_dim = state_dim
-        self._states = None  # (N, state_dim) float32 or None
+        self._states = None  # (N, state_dim) float32 or None; only populated when state_dim > 0
 
-        # Try loading from cache first.
-        # Cache is a directory with frames.npy and optionally states.npy.
-        # Uses mmap_mode='r' — memory-mapped, no RAM allocation. OS pages
-        # data from disk on demand. DataLoader workers handle parallelism.
+        # --- Cache fast path ---
+        # Try loading from cache first. Cache is a directory with frames.npy
+        # and optionally states.npy. Uses mmap_mode='r' — memory-mapped, no
+        # RAM allocation. The OS pages data from disk on demand, so even 10GB
+        # of frames uses near-zero resident memory. DataLoader workers each
+        # get their own page faults, which the OS handles transparently.
         if cache_path is not None and Path(cache_path).is_dir():
             frames_file = Path(cache_path) / "frames.npy"
             if frames_file.exists():
@@ -188,21 +225,30 @@ class PixelFrameDataset(Dataset):
                 print(f"PixelFrameDataset: {n} frames{state_str} ({disk_mb:.0f} MB on disk, mmap)")
                 return
 
-        # Normalize to list of paths
+        # --- Full load path (no cache or cache miss) ---
+        # Normalize to list of paths so callers can pass a single string or
+        # multiple data directories (e.g., heuristic + random episodes).
         if isinstance(data_path, (str, Path)):
             data_path = [data_path]
         npz_files = []
+        # Walk with followlinks=True so symlinked data dirs work (common on
+        # shared compute where data lives on a different filesystem).
         for dp in data_path:
             for root, _dirs, files in os.walk(str(Path(dp)), followlinks=True):
                 for f in files:
                     if f.endswith(".npz"):
                         npz_files.append(Path(root) / f)
+        # Sort for deterministic ordering across platforms/filesystems.
         npz_files.sort()
+        # Filter out "prepared" cache files that PixelEpisodeDataset may have
+        # saved alongside the raw episodes — they use a different format.
         npz_files = [f for f in npz_files if "prepared" not in f.name]
         episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
         if state_dim > 0:
-            # Load frames + states
+            # Load frames + kinematic states for the auxiliary state prediction
+            # head. States are used as supervised targets during VAE training
+            # to encourage the latent space to encode physical quantities.
             load_args = [(path, frame_size, grayscale, state_dim) for path in episode_files]
             all_frames = []
             all_states = []
@@ -225,10 +271,15 @@ class PixelFrameDataset(Dataset):
                             all_states.append(states)
 
             if all_frames:
+                # Concatenate all episodes into a single flat array of frames.
+                # After this, episode boundaries are lost — each frame is an
+                # independent training sample for the VAE.
                 self._frames = np.concatenate(all_frames, axis=0)
                 if all_states:
                     self._states = np.concatenate(all_states, axis=0).astype(np.float32)
             else:
+                # Empty placeholder so len() and __getitem__ work gracefully
+                # even if all episodes failed to load.
                 self._frames = np.zeros((0, frame_size, frame_size), dtype=np.uint8)
         else:
             # Frames only (original path)
@@ -276,7 +327,10 @@ class PixelFrameDataset(Dataset):
         return self._frames.shape[0]
 
     def __getitem__(self, idx: int) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        frame = _frame_to_tensor(np.array(self._frames[idx]))  # copy from mmap
+        # np.array() copies the mmap slice into a writable array — without
+        # this, PyTorch warns about non-writable tensors (mmap pages are
+        # read-only). The copy is tiny (one frame: 84*84 = 7KB).
+        frame = _frame_to_tensor(np.array(self._frames[idx]))
         if self._states is not None:
             state = torch.from_numpy(np.array(self._states[idx])).float()
             return frame, state
@@ -309,12 +363,19 @@ class PixelEpisodeDataset(Dataset):
         self.seq_len = seq_len
         self.frame_stack = frame_stack
 
+        # Minimum episode length to yield at least one training window.
+        # We need seq_len timesteps, plus (frame_stack - 1) extra past frames
+        # for the initial stacked observation, plus 1 for the frame→frame
+        # transition at the last timestep.
         min_frames = seq_len + frame_stack - 1 + 1
 
-        # Pre-load frames and actions per episode, build window index
+        # Per-episode storage — we keep episodes separate (not flattened)
+        # because windows must not cross episode boundaries.
         self._episode_frames = []  # list of (T+1, H, W) uint8 arrays
         self._episode_actions = []  # list of (T, action_dim) float32 arrays
-        self._window_index = []  # (episode_idx, start_frame)
+        # Flat index mapping: window_index[i] = (episode_idx, start_frame)
+        # so __getitem__ can jump directly to any valid window in O(1).
+        self._window_index = []
 
         # Try cache first
         if cache_path is not None and Path(cache_path).exists():
@@ -362,14 +423,19 @@ class PixelEpisodeDataset(Dataset):
                     self._episode_frames.append(frames)
                     self._episode_actions.append(actions)
 
+                    # Enumerate all valid window start positions within this
+                    # episode. Start at (frame_stack - 1) so there are enough
+                    # past frames to build the initial stacked observation.
                     max_start = frames.shape[0] - seq_len - frame_stack + 1
                     for s in range(frame_stack - 1, frame_stack - 1 + max_start):
                         self._window_index.append((ep_idx, s))
 
-            # Save cache
+            # Save cache so subsequent runs skip the expensive npz loading
             if cache_path is not None and self._episode_frames:
                 Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-                # Use object arrays to store variable-length episodes
+                # Use object arrays because episodes have different lengths —
+                # a regular ndarray would require padding. Object arrays let
+                # np.savez pickle each variable-length array independently.
                 np.savez(
                     str(cache_path),
                     all_frames=np.array(self._episode_frames, dtype=object),
@@ -392,21 +458,31 @@ class PixelEpisodeDataset(Dataset):
         frames = self._episode_frames[ep_idx]
         actions = self._episode_actions[ep_idx]
 
+        # Reach back (frame_stack - 1) frames before `start` to have enough
+        # history for the initial stacked observation at t=0.
         frame_start = start - (self.frame_stack - 1)
         frame_end = start + self.seq_len
         raw_chunk = frames[frame_start:frame_end]  # already preprocessed uint8
         act_chunk = actions[start:start + self.seq_len]
 
-        # Convert frames to tensors
+        # Convert each raw frame to a (C, H, W) float tensor in [0, 1]
         processed = [_frame_to_tensor(raw_chunk[i]) for i in range(len(raw_chunk))]
 
-        # Build stacked frames
+        # Build stacked-frame observations by concatenating `frame_stack`
+        # consecutive frames along the channel dimension. This gives the
+        # dynamics model access to short-term motion information (velocity
+        # cues) without requiring an explicit velocity input.
         stacked_frames = []
         for t in range(self.seq_len):
+            # processed[t:t+frame_stack] are frame_stack consecutive frames;
+            # cat along dim=0 produces (C*frame_stack, H, W).
             stack = torch.cat(processed[t:t + self.frame_stack], dim=0)
             stacked_frames.append(stack)
 
+        # Final shapes: frames (seq_len, C*frame_stack, H, W), actions (seq_len, action_dim)
         frames_tensor = torch.stack(stacked_frames, dim=0)
+        # .copy() because the numpy slice may share memory with the episode
+        # array, and PyTorch prefers owning the underlying storage.
         actions_tensor = torch.from_numpy(act_chunk.copy()).float()
 
         return frames_tensor, actions_tensor

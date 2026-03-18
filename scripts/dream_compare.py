@@ -35,6 +35,8 @@ import imageio
 import numpy as np
 import torch
 
+# Add the project root to sys.path so this script can be run directly
+# (e.g., `python scripts/dream_compare.py`) without requiring a package install.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.pixel_vae import PixelVAE
@@ -45,6 +47,8 @@ from models.pixel_world_model import PixelWorldModel
 def load_pixel_world_model(vae_path: str, dyn_path: str,
                            device: str) -> PixelWorldModel:
     """Load trained PixelWorldModel from VAE + dynamics checkpoints."""
+    # Reconstruct VAE architecture from the config stored in the checkpoint,
+    # so the caller doesn't need to pass architecture flags manually.
     vae_ckpt = torch.load(vae_path, map_location=device, weights_only=False)
     cfg = vae_ckpt["config"]
     vae = PixelVAE(
@@ -56,6 +60,8 @@ def load_pixel_world_model(vae_path: str, dyn_path: str,
     )
     vae.load_state_dict(vae_ckpt["model_state_dict"])
 
+    # Dynamics model uses latent_dim from the VAE config (must match) and
+    # its own action_dim/hidden_size from its checkpoint config.
     dyn_ckpt = torch.load(dyn_path, map_location=device, weights_only=False)
     dyn_cfg = dyn_ckpt["config"]
     dynamics = LatentDynamicsModel(
@@ -65,6 +71,7 @@ def load_pixel_world_model(vae_path: str, dyn_path: str,
     )
     dynamics.load_state_dict(dyn_ckpt["model_state_dict"])
 
+    # Compose VAE + dynamics into a single PixelWorldModel for the dream API
     model = PixelWorldModel(vae, dynamics)
     model.to(device)
     model.eval()
@@ -73,12 +80,18 @@ def load_pixel_world_model(vae_path: str, dyn_path: str,
 
 def preprocess_episode(raw_frames: np.ndarray, frame_size: int,
                        grayscale: bool = True) -> np.ndarray:
-    """Preprocess all frames from an episode. Returns (T+1, H, W) uint8."""
+    """Preprocess all frames from an episode. Returns (T+1, H, W) uint8.
+
+    Duplicates the preprocessing logic from data/pixel_dataset.py so this
+    script can run standalone without importing the dataset module. Must
+    stay in sync with _preprocess_frame() there.
+    """
     processed = []
     for i in range(len(raw_frames)):
         frame = raw_frames[i]
         if grayscale and frame.ndim == 3 and frame.shape[2] == 3:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        # INTER_AREA for downscaling to match training preprocessing
         frame = cv2.resize(frame, (frame_size, frame_size),
                            interpolation=cv2.INTER_AREA)
         processed.append(frame)
@@ -102,27 +115,37 @@ def dream_with_regrounding(model: PixelWorldModel, gt_frames: np.ndarray,
     n = len(actions)
     dreamed = []
 
-    # Encode seed
+    # Encode the first real frame into latent space as the dream seed.
+    # Shape: (1, latent_dim) — unsqueeze adds batch and channel dims for
+    # the VAE encoder which expects (B, C, H, W).
     seed_tensor = torch.from_numpy(gt_frames[0]).float().unsqueeze(0).unsqueeze(0) / 255.0
     z = model.vae.encode(seed_tensor)
-    hidden = None
+    hidden = None  # GRU hidden state starts fresh for each dream
 
-    # First frame: decode seed
+    # Decode the seed latent to get frame 0 of the dream — this shows how
+    # much information the VAE retains (useful baseline for the comparison).
     decoded = model.vae.decode(z).squeeze().detach().numpy()
     dreamed.append((decoded * 255).clip(0, 255).astype(np.uint8))
 
     for t in range(n):
         action = torch.from_numpy(actions[t]).float().unsqueeze(0)
 
-        # Re-ground every K steps
+        # Re-grounding: periodically replace the predicted latent with the
+        # real frame's encoding. This bounds error accumulation and lets us
+        # measure how fast the dream diverges as a function of K.
+        # hidden=None resets the GRU state since the re-grounded latent may
+        # be inconsistent with the accumulated hidden state.
         if reground_every > 0 and t > 0 and t % reground_every == 0:
             real_tensor = torch.from_numpy(gt_frames[t]).float().unsqueeze(0).unsqueeze(0) / 255.0
             z = model.vae.encode(real_tensor)
             hidden = None
 
         with torch.no_grad():
+            # Step the dynamics model one timestep forward in latent space
             z_next, hidden = model.dynamics(z, action, hidden)
+            # Decode predicted latent to pixel space for the output video
             frame = model.vae.decode(z_next).squeeze().detach().numpy()
+            # Feed the predicted latent forward (autoregressive rollout)
             z = z_next
 
         dreamed.append((frame * 255).clip(0, 255).astype(np.uint8))
@@ -134,10 +157,17 @@ def save_comparison_mp4(gt: np.ndarray, dreamed: np.ndarray,
                         path: str, fps: int = 10):
     """Save GT | Dream side-by-side MP4."""
     T = min(len(gt), len(dreamed))
+    # Concatenate along width (axis=2) to produce [GT | Dream] layout.
+    # The viewer sees real and predicted frames at the same timestamp
+    # side-by-side, making divergence easy to spot visually.
     combined = np.concatenate([gt[:T], dreamed[:T]], axis=2)
+    # Replicate grayscale across RGB channels — H.264 requires 3-channel input
     frames_rgb = np.stack([combined] * 3, axis=-1)
 
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    # macro_block_size=1 avoids the default 16-pixel padding that libx264
+    # adds when frame dimensions aren't multiples of 16 (84*2=168 is not
+    # a multiple of 16, so without this the video would have black bars).
     writer = imageio.get_writer(path, fps=fps, codec="libx264",
                                 pixelformat="yuv420p",
                                 macro_block_size=1)
@@ -152,7 +182,9 @@ def find_episodes(data_path: str, policy: str, n_episodes: int) -> list[Path]:
     if not policy_dir.exists():
         return []
     files = sorted(policy_dir.glob("episode_*.npz"))
-    # Sample evenly across available episodes
+    # Sample evenly across the episode range rather than taking the first N.
+    # This gives a more representative cross-section of episode diversity
+    # (early episodes may be short crashes, later ones longer flights).
     if len(files) <= n_episodes:
         return files
     step = len(files) // n_episodes
@@ -181,6 +213,7 @@ def main():
     print(f"Loading model...")
     model, vae_cfg = load_pixel_world_model(
         args.vae_checkpoint, args.dynamics_checkpoint, args.device)
+    # Pull preprocessing config from the VAE so dream frames match training
     frame_size = vae_cfg["frame_size"]
     grayscale = vae_cfg.get("in_channels", 1) == 1
     print(f"  frame_size={frame_size}, grayscale={grayscale}")
@@ -203,8 +236,12 @@ def main():
             actions = data["actions"]
             n_steps = len(actions)
 
+            # Preprocess GT frames the same way the VAE saw them during training
             gt = preprocess_episode(raw_frames[:n_steps + 1], frame_size, grayscale)
 
+            # Generate one video per re-grounding interval. K=0 means a fully
+            # autoregressive dream (no re-grounding), which shows worst-case
+            # error accumulation. K>0 re-encodes the real frame every K steps.
             for K in args.reground:
                 tag = f"k{K}" if K > 0 else "full_dream"
                 dreamed = dream_with_regrounding(model, gt, actions, reground_every=K)
