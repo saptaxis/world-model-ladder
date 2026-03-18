@@ -2,7 +2,8 @@
 """Tests for pixel-space loss functions."""
 import torch
 import pytest
-from training.pixel_losses import vae_loss, latent_dynamics_loss
+from training.pixel_losses import vae_loss, latent_dynamics_loss, multi_step_latent_loss
+from models.pixel_dynamics import LatentDynamicsModel
 
 
 class TestVAELoss:
@@ -40,3 +41,34 @@ class TestLatentDynamicsLoss:
         z_target = torch.randn(4, 10, 64)
         loss = latent_dynamics_loss(z_pred, z_target)
         assert loss.item() > 0
+
+
+class TestMultiStepLatentLoss:
+    def test_output_is_scalar(self):
+        """Multi-step loss returns a scalar tensor."""
+        model = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        z_seq = torch.randn(2, 6, 8)  # B=2, T=6, D=8
+        actions = torch.randn(2, 5, 2)  # T-1 actions
+        loss = multi_step_latent_loss(model, z_seq, actions, k=4)
+        assert loss.dim() == 0
+        assert loss.item() > 0
+
+    def test_gradient_flows_through_chain(self):
+        """Gradients propagate from loss back through rollout to z_seq."""
+        model = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        z_seq = torch.randn(2, 6, 8, requires_grad=True)
+        actions = torch.randn(2, 5, 2)
+        loss = multi_step_latent_loss(model, z_seq, actions, k=4)
+        loss.backward()
+        # z_seq[:, 0] is the seed — gradient must flow back to it
+        assert z_seq.grad is not None
+        assert z_seq.grad[:, 0].abs().sum() > 0
+
+    def test_k_clamped_to_sequence_length(self):
+        """k larger than sequence is silently clamped."""
+        model = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        z_seq = torch.randn(2, 4, 8)  # T=4
+        actions = torch.randn(2, 3, 2)  # T-1=3 actions
+        # k=10 > T-1=3, should clamp to 3
+        loss = multi_step_latent_loss(model, z_seq, actions, k=10)
+        assert loss.dim() == 0

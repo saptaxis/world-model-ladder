@@ -90,3 +90,40 @@ def latent_dynamics_loss(z_pred: torch.Tensor,
                          z_target: torch.Tensor) -> torch.Tensor:
     """MSE loss in latent space for dynamics prediction."""
     return F.mse_loss(z_pred, z_target)
+
+
+def multi_step_latent_loss(dynamics: torch.nn.Module,
+                           z_seq: torch.Tensor,
+                           actions: torch.Tensor,
+                           k: int) -> torch.Tensor:
+    """k-step autoregressive loss with full gradient flow.
+
+    Rolls out k steps from z_seq[:, 0] using dynamics.rollout() and
+    computes MSE at every step against encoded-GT z. Unlike
+    predict_sequence() which detaches own predictions, rollout() keeps
+    the full computation graph — gradients flow through the entire
+    autoregressive chain, teaching the model to produce z's that work
+    as inputs for future steps.
+
+    Args:
+        dynamics: model with rollout(z_start, actions) -> (z_seq, state).
+            Both LatentDynamicsModel (GRU) and LatentRSSM implement this.
+        z_seq: (B, T, latent_dim) encoded GT latent sequence.
+        actions: (B, T-1, action_dim) actions between frames.
+        k: rollout horizon. Clamped to min(k, T-1, len(actions)).
+
+    Returns:
+        Scalar MSE loss averaged over all k steps and batch.
+    """
+    T = z_seq.size(1)
+    n_actions = actions.size(1)
+    # Clamp k to available sequence length — avoids index-out-of-bounds
+    # when caller requests a horizon longer than the episode
+    k = min(k, T - 1, n_actions)
+
+    # Autoregressive rollout from seed z_0 — full gradient flow
+    # rollout() returns (B, k+1, D) including the seed frame at index 0
+    z_pred, _ = dynamics.rollout(z_seq[:, 0], actions[:, :k])
+    # Compare predicted latents (skip seed) to ground-truth targets
+    # MSE averaged over batch, time steps, and latent dims
+    return F.mse_loss(z_pred[:, 1:], z_seq[:, 1:k + 1])
