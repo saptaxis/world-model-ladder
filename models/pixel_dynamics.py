@@ -46,16 +46,19 @@ class LatentDynamicsModel(nn.Module):
             nn.Linear(hidden_size, latent_dim),
         )
 
-    def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
+    def initial_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Create zero-initialized hidden state. Shape: (1, B, hidden_size)."""
         return torch.zeros(1, batch_size, self.hidden_size, device=device)
+
+    # Backward compatibility alias
+    init_hidden = initial_state
 
     def forward(self, z: torch.Tensor, action: torch.Tensor,
                 hidden: torch.Tensor | None = None
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """Single-step prediction."""
         if hidden is None:
-            hidden = self.init_hidden(z.size(0), z.device)
+            hidden = self.initial_state(z.size(0), z.device)
 
         x = torch.cat([z, action], dim=-1)
         x = self.input_proj(x)
@@ -71,7 +74,7 @@ class LatentDynamicsModel(nn.Module):
         """Multi-step autoregressive rollout. Returns (B, T+1, latent_dim) including z_start."""
         T = actions.size(1)
         if hidden is None:
-            hidden = self.init_hidden(z_start.size(0), z_start.device)
+            hidden = self.initial_state(z_start.size(0), z_start.device)
 
         z_seq = [z_start]
         z = z_start
@@ -88,7 +91,7 @@ class LatentDynamicsModel(nn.Module):
         """Predict next latents for a sequence (training with scheduled sampling)."""
         B, T, _ = z_sequence.shape
         if hidden is None:
-            hidden = self.init_hidden(B, z_sequence.device)
+            hidden = self.initial_state(B, z_sequence.device)
 
         z_preds = []
         z = z_sequence[:, 0]

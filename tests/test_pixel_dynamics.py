@@ -51,9 +51,14 @@ class TestLatentDynamicsModel:
         z_pred, hidden = model.predict_sequence(z_seq, actions, teacher_forcing=0.0)
         assert z_pred.shape == (4, 10, 64)
 
-    def test_init_hidden(self):
-        """init_hidden creates zero hidden state."""
+    def test_initial_state(self):
+        """initial_state creates zero hidden state."""
         model = LatentDynamicsModel(latent_dim=64, action_dim=2, hidden_size=256)
-        hidden = model.init_hidden(4, torch.device("cpu"))
+        hidden = model.initial_state(4, torch.device("cpu"))
         assert hidden.shape == (1, 4, 256)
         assert (hidden == 0).all()
+
+    def test_init_hidden_alias(self):
+        """init_hidden is preserved as alias for backward compat."""
+        model = LatentDynamicsModel(latent_dim=64, action_dim=2, hidden_size=256)
+        assert model.init_hidden(2, torch.device("cpu")).shape == (1, 2, 256)
