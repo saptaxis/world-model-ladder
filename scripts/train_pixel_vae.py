@@ -61,6 +61,12 @@ def parse_args():
                    help="Parallel workers for initial npz loading")
     p.add_argument("--cache-dir", type=str, default=None,
                    help="Dir to cache preprocessed frames (.npy). Instant load on reruns.")
+    p.add_argument("--lr-patience", type=int, default=0,
+                   help="ReduceLROnPlateau patience (0 = no scheduler)")
+    p.add_argument("--lr-factor", type=float, default=0.5,
+                   help="LR reduction factor when plateau detected")
+    p.add_argument("--lr-min", type=float, default=1e-6,
+                   help="Minimum LR for scheduler")
     p.add_argument("--grayscale", action="store_true", default=True)
     p.add_argument("--no-grayscale", dest="grayscale", action="store_false")
     return p.parse_args()
@@ -120,6 +126,15 @@ def main():
     print(f"PixelVAE: {param_count:,} parameters")
 
     optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
+
+    scheduler = None
+    if args.lr_patience > 0:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=args.lr_factor,
+            patience=args.lr_patience, min_lr=args.lr_min, verbose=True,
+        )
+        print(f"LR scheduler: ReduceLROnPlateau(patience={args.lr_patience}, "
+              f"factor={args.lr_factor}, min_lr={args.lr_min})")
 
     # TensorBoard
     writer = SummaryWriter(log_dir=str(vae_dir / "tb"))
@@ -213,6 +228,12 @@ def main():
         state_str = f" state={result['state_loss']:.6f}" if args.state_dim > 0 else ""
         print(f"Epoch {epoch}: train_loss={result['train_loss']:.6f} "
               f"recon={result['recon_loss']:.6f} kl={result['kl_loss']:.6f}{state_str}")
+
+        if ctx.writer:
+            ctx.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], ctx.global_step)
+
+        if scheduler is not None and "val_loss" in ctx.extras:
+            scheduler.step(ctx.extras["val_loss"])
 
         for cb in callbacks:
             if cb.on_epoch_end(ctx) is False:

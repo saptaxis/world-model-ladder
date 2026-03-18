@@ -90,6 +90,12 @@ def parse_args():
                    help="Parallel workers for initial npz loading")
     p.add_argument("--cache-dir", type=str, default=None,
                    help="Dir to cache preprocessed episodes. Instant load on reruns.")
+    p.add_argument("--lr-patience", type=int, default=0,
+                   help="ReduceLROnPlateau patience (0 = no scheduler)")
+    p.add_argument("--lr-factor", type=float, default=0.5,
+                   help="LR reduction factor when plateau detected")
+    p.add_argument("--lr-min", type=float, default=1e-6,
+                   help="Minimum LR for scheduler")
     return p.parse_args()
 
 
@@ -172,6 +178,17 @@ def main():
     print(f"LatentDynamicsModel: {param_count:,} parameters")
 
     optimizer = torch.optim.Adam(dynamics.parameters(), lr=args.lr)
+
+    # LR scheduler (optional — only if --lr-patience > 0)
+    scheduler = None
+    if args.lr_patience > 0:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=args.lr_factor,
+            patience=args.lr_patience, min_lr=args.lr_min, verbose=True,
+        )
+        print(f"LR scheduler: ReduceLROnPlateau(patience={args.lr_patience}, "
+              f"factor={args.lr_factor}, min_lr={args.lr_min})")
+
     writer = SummaryWriter(log_dir=str(dyn_dir / "tb"))
 
     config = {
@@ -256,6 +273,11 @@ def main():
 
         if ctx.writer:
             ctx.writer.add_scalar("train/sampling_prob", sampling_prob, ctx.global_step)
+            ctx.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], ctx.global_step)
+
+        # Step LR scheduler on val loss
+        if scheduler is not None and "val_loss" in ctx.extras:
+            scheduler.step(ctx.extras["val_loss"])
 
         for cb in callbacks:
             if cb.on_epoch_end(ctx) is False:
