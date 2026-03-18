@@ -17,7 +17,9 @@ import torch
 import torch.nn as nn
 
 from training.callbacks import TrainCallback, CallbackContext
-from training.pixel_losses import vae_loss, latent_dynamics_loss
+from training.pixel_losses import (
+    vae_loss, latent_dynamics_loss, multi_step_latent_loss, latent_elbo_loss,
+)
 
 
 class PixelVAEValidationCallback(TrainCallback):
@@ -147,16 +149,31 @@ class ReconGridCallback(TrainCallback):
 
 
 class PixelDynamicsValidationCallback(TrainCallback):
-    """Dynamics validation with early stopping."""
+    """Dynamics validation with early stopping.
+
+    Supports three training modes that mirror the training loop's loss
+    dispatch, so validation loss matches training loss semantics:
+    - latent_mse: single-step predict_sequence + MSE (original GRU default)
+    - multi_step_latent: k-step autoregressive rollout + MSE (GRU or RSSM)
+    - latent_elbo: ELBO = reconstruction MSE + KL (RSSM only)
+    """
 
     def __init__(self, val_loader, vae: nn.Module,
                  every_n_steps: int = 500, patience: int = 10,
-                 checkpoint_dir: str | None = None):
+                 checkpoint_dir: str | None = None,
+                 training_mode: str = "latent_mse",
+                 rollout_k: int = 1,
+                 kl_weight: float = 1.0):
         self.val_loader = val_loader
         self.vae = vae
         self.every_n_steps = every_n_steps
         self.patience = patience
         self.checkpoint_dir = checkpoint_dir
+        # Loss dispatch params — must match training loop config so
+        # val loss is comparable to train loss
+        self.training_mode = training_mode
+        self.rollout_k = rollout_k
+        self.kl_weight = kl_weight
         self.best_val_loss = float("inf")
         self.patience_counter = 0
         self.last_val_step = -1
@@ -164,6 +181,28 @@ class PixelDynamicsValidationCallback(TrainCallback):
     def on_train_start(self, ctx):
         if self.checkpoint_dir:
             Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+    def _compute_loss(self, ctx, z_seq: torch.Tensor,
+                      actions: torch.Tensor) -> torch.Tensor:
+        """Dispatch to correct loss function based on training_mode.
+
+        Mirrors the training loop's loss dispatch so validation loss
+        is directly comparable to training loss.
+        """
+        if self.training_mode == "multi_step_latent":
+            # k-step autoregressive rollout — works for both GRU and RSSM
+            return multi_step_latent_loss(ctx.model, z_seq, actions,
+                                          k=self.rollout_k)
+        elif self.training_mode == "latent_elbo":
+            # ELBO loss — RSSM only (needs step() and kl_loss())
+            return latent_elbo_loss(ctx.model, z_seq, actions,
+                                    k=self.rollout_k,
+                                    kl_weight=self.kl_weight)
+        else:
+            # Default: single-step predict_sequence + MSE (original behavior)
+            z_pred, _ = ctx.model.predict_sequence(
+                z_seq, actions, teacher_forcing=0.0)
+            return latent_dynamics_loss(z_pred[:, :-1], z_seq[:, 1:])
 
     def on_step(self, ctx) -> bool:
         if ctx.global_step == 0:
@@ -185,9 +224,8 @@ class PixelDynamicsValidationCallback(TrainCallback):
                 z_all = self.vae.encode(frames_flat)
                 latent_dim = z_all.shape[-1]
                 z_seq = z_all.reshape(B, T, latent_dim)
-                z_pred, _ = ctx.model.predict_sequence(
-                    z_seq, actions, teacher_forcing=0.0)
-                loss = latent_dynamics_loss(z_pred[:, :-1], z_seq[:, 1:])
+                # Dispatch to correct loss function matching training loop
+                loss = self._compute_loss(ctx, z_seq, actions)
                 total_loss += loss.item()
                 n += 1
         ctx.model.train()
@@ -210,6 +248,9 @@ class PixelDynamicsValidationCallback(TrainCallback):
                     "val_loss": val_loss,
                     "config": ctx.extras.get("config", {}),
                     "vae_checkpoint": ctx.extras.get("vae_checkpoint", ""),
+                    # Track model architecture so checkpoint loader knows
+                    # which dynamics class to instantiate
+                    "model_type": ctx.extras.get("model_type", "gru"),
                 }, Path(self.checkpoint_dir) / "best.pt")
         else:
             self.patience_counter += 1
@@ -223,13 +264,20 @@ class PixelDynamicsValidationCallback(TrainCallback):
 
 
 class DreamGridCallback(TrainCallback):
-    """Log dream sequence to TensorBoard during dynamics training."""
+    """Log GT|Dream side-by-side grids to TensorBoard during dynamics training.
 
-    def __init__(self, vae: nn.Module, sample_frames: torch.Tensor,
-                 sample_actions: torch.Tensor, every_n_steps: int = 1000):
+    Each firing samples random episodes from val_dataset, encodes GT frames,
+    rolls out dreamed latents via model.rollout(), decodes both, and shows
+    GT (top) vs Dream (bottom) for each episode. Random sampling means each
+    firing shows different episodes for qualitative diversity.
+    """
+
+    def __init__(self, vae: nn.Module, val_dataset,
+                 n_episodes: int = 4, every_n_steps: int = 1000):
         self.vae = vae
-        self.sample_frames = sample_frames
-        self.sample_actions = sample_actions
+        # Store dataset (not loader) so we can sample random episodes each firing
+        self.val_dataset = val_dataset
+        self.n_episodes = n_episodes
         self.every_n_steps = every_n_steps
 
     def on_step(self, ctx) -> bool:
@@ -240,27 +288,43 @@ class DreamGridCallback(TrainCallback):
 
         ctx.model.eval()
         with torch.no_grad():
-            seed = self.sample_frames.to(ctx.device)
-            actions = self.sample_actions.to(ctx.device)
-            z = self.vae.encode(seed)
-            T = actions.size(1)
+            # Sample random episodes each firing for diversity
+            indices = torch.randperm(len(self.val_dataset))[:self.n_episodes]
+            episodes = [self.val_dataset[i] for i in indices]
 
-            z_seq = [z]
-            hidden = None
-            for t in range(T):
-                z_next, hidden = ctx.model(z, actions[:, t], hidden)
-                z_seq.append(z_next)
-                z = z_next
+            rows = []
+            for frames_ep, actions_ep in episodes:
+                # frames_ep: (T, C, H, W), actions_ep: (T-1, action_dim)
+                frames = frames_ep.to(ctx.device)
+                actions = actions_ep.to(ctx.device).unsqueeze(0)  # (1, T-1, A)
+                T = frames.size(0)
 
-            indices = list(range(0, len(z_seq), max(1, len(z_seq) // 6)))[:6]
-            frames = []
-            for i in indices:
-                frame = self.vae.decode(z_seq[i])
-                frames.append(frame)
+                # Encode all GT frames to latent space
+                z_gt = self.vae.encode(frames)  # (T, latent_dim)
+
+                # Dream: rollout from first frame's latent using model.rollout()
+                # rollout() works for both GRU and RSSM — returns (1, T, D)
+                z_dream, _ = ctx.model.rollout(z_gt[0:1], actions)
+                z_dream = z_dream.squeeze(0)  # (T, latent_dim)
+
+                # Pick evenly-spaced frames to show (up to 6)
+                show_indices = list(
+                    range(0, T, max(1, T // 6))
+                )[:6]
+
+                # Decode GT and dream latents at selected timesteps
+                gt_frames = self.vae.decode(z_gt[show_indices])
+                dream_frames = self.vae.decode(z_dream[show_indices])
+
+                # Stack GT on top, dream on bottom for this episode
+                rows.append(gt_frames)
+                rows.append(dream_frames)
 
             try:
                 from torchvision.utils import make_grid
-                grid = make_grid(torch.cat(frames, dim=0), nrow=len(frames),
+                # Each row has len(show_indices) frames; nrow controls columns
+                n_cols = len(show_indices)
+                grid = make_grid(torch.cat(rows, dim=0), nrow=n_cols,
                                  normalize=False)
                 ctx.writer.add_image("dynamics/dream_grid", grid, ctx.global_step)
             except ImportError:
