@@ -1,10 +1,12 @@
 # models/pixel_dynamics.py
-"""GRU-based dynamics model operating in VAE latent space.
+"""GRU-based dynamics models operating in VAE latent space.
 
-Predicts next latent z_{t+1} from current latent z_t and action a_t.
-Maintains GRU hidden state for temporal context. Supports single-step,
-multi-step rollout, and teacher-forced sequence prediction with
-configurable scheduled sampling.
+Two variants:
+  LatentDynamicsModel — concatenation-based action conditioning (original)
+  FiLMDynamicsModel — FiLM action conditioning (Perez et al. 2018)
+
+Both share the same interface (forward, rollout, predict_sequence, initial_state)
+so they're interchangeable in PixelWorldModel and the training loop.
 """
 from __future__ import annotations
 
@@ -136,6 +138,152 @@ class LatentDynamicsModel(nn.Module):
                     # Detach during training to prevent gradients from flowing
                     # back through the entire autoregressive chain, which would
                     # cause memory issues and unstable training
+                    z = z_next.detach() if self.training else z_next
+
+        return torch.stack(z_preds, dim=1), hidden
+
+
+class FiLMDynamicsModel(nn.Module):
+    """GRU dynamics with FiLM action conditioning (Perez et al. 2018).
+
+    Instead of concatenating [z, action] and hoping the network learns to
+    use the action, the action MULTIPLICATIVELY MODULATES state features:
+
+        state_features = state_proj(z)
+        gamma, beta = action_to_film(action)
+        modulated = gamma * state_features + beta
+        gru_input = modulated
+
+    This gives the action structural control over the prediction. With
+    concatenation, the action is just more input features the GRU has to
+    learn to gate on through internal nonlinearities — weak conditioning.
+    With FiLM, the action directly scales and shifts state features —
+    strong conditioning by design.
+
+    Same interface as LatentDynamicsModel (forward, rollout, predict_sequence,
+    initial_state) so it's a drop-in replacement.
+
+    Args:
+        latent_dim: VAE latent dimensionality (input/output)
+        action_dim: action vector dimensionality
+        hidden_size: GRU hidden state size and FiLM feature size
+    """
+
+    def __init__(self, latent_dim: int = 64, action_dim: int = 2,
+                 hidden_size: int = 256):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.action_dim = action_dim
+        self.hidden_size = hidden_size
+
+        # State projection: map z to hidden_size features BEFORE action
+        # modulation. This is the "content" pathway — what the GRU sees
+        # about the current state, before actions modify it.
+        self.state_proj = nn.Sequential(
+            nn.Linear(latent_dim, hidden_size),
+            nn.ReLU(inplace=True),
+        )
+
+        # FiLM generator: action → (gamma, beta) for modulating state features.
+        # gamma (scale) and beta (shift) each have hidden_size dimensions.
+        # A small hidden layer (64) before the split lets the network learn
+        # nonlinear action-to-modulation mappings while keeping the generator
+        # lightweight relative to the main pathway.
+        self.film_generator = nn.Sequential(
+            nn.Linear(action_dim, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, hidden_size * 2),  # first half = gamma, second = beta
+        )
+
+        # GRU operates on modulated features — same as LatentDynamicsModel
+        self.gru = nn.GRU(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True,
+        )
+
+        # Output projection: GRU hidden → predicted z_next
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_size, latent_dim),
+        )
+
+    def initial_state(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Create zero-initialized hidden state. Shape: (1, B, hidden_size)."""
+        return torch.zeros(1, batch_size, self.hidden_size, device=device)
+
+    # Backward compatibility alias
+    init_hidden = initial_state
+
+    def forward(self, z: torch.Tensor, action: torch.Tensor,
+                hidden: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-step prediction with FiLM action conditioning."""
+        if hidden is None:
+            hidden = self.initial_state(z.size(0), z.device)
+
+        # State pathway: project z to feature space
+        state_features = self.state_proj(z)  # (B, hidden_size)
+
+        # Action pathway: generate FiLM modulation parameters
+        film_params = self.film_generator(action)  # (B, hidden_size * 2)
+        # Split into scale (gamma) and shift (beta).
+        # gamma centered at 1.0 (via +1) so the default modulation is identity —
+        # an untrained model passes state features through unchanged, which is
+        # a better initialization than random scaling.
+        gamma, beta = film_params.chunk(2, dim=-1)
+        gamma = gamma + 1.0  # center at 1 so default is identity
+
+        # FiLM modulation: action controls how state features are transformed.
+        # gamma scales features (action can amplify or suppress state dimensions),
+        # beta shifts features (action can bias the prediction direction).
+        x = gamma * state_features + beta  # (B, hidden_size)
+
+        # GRU step — same as LatentDynamicsModel from here
+        x = x.unsqueeze(1)
+        output, hidden = self.gru(x, hidden)
+        output = output.squeeze(1)
+        z_next = self.output_proj(output)
+        return z_next, hidden
+
+    def rollout(self, z_start: torch.Tensor, actions: torch.Tensor,
+                hidden: torch.Tensor | None = None
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Multi-step autoregressive rollout. Returns (B, T+1, latent_dim) including z_start."""
+        T = actions.size(1)
+        if hidden is None:
+            hidden = self.initial_state(z_start.size(0), z_start.device)
+
+        z_seq = [z_start]
+        z = z_start
+        for t in range(T):
+            z, hidden = self.forward(z, actions[:, t], hidden)
+            z_seq.append(z)
+
+        return torch.stack(z_seq, dim=1), hidden
+
+    def predict_sequence(self, z_sequence: torch.Tensor, actions: torch.Tensor,
+                         hidden: torch.Tensor | None = None,
+                         teacher_forcing: float = 1.0
+                         ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Predict next latents for a sequence (training with scheduled sampling)."""
+        B, T, _ = z_sequence.shape
+        if hidden is None:
+            hidden = self.initial_state(B, z_sequence.device)
+
+        z_preds = []
+        z = z_sequence[:, 0]
+
+        for t in range(T):
+            z_next, hidden = self.forward(z, actions[:, t], hidden)
+            z_preds.append(z_next)
+
+            if t < T - 1:
+                if self.training and torch.rand(1).item() < teacher_forcing:
+                    z = z_sequence[:, t + 1]
+                else:
                     z = z_next.detach() if self.training else z_next
 
         return torch.stack(z_preds, dim=1), hidden

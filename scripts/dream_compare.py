@@ -75,6 +75,13 @@ def load_pixel_world_model(vae_path: str, dyn_path: str,
             stoch_dim=dyn_cfg.get("stoch_dim", 30),
             hidden_dim=dyn_cfg.get("hidden_size", 200),
         )
+    elif model_type == "film":
+        from models.pixel_dynamics import FiLMDynamicsModel
+        dynamics = FiLMDynamicsModel(
+            latent_dim=cfg["latent_dim"],
+            action_dim=dyn_cfg.get("action_dim", 2),
+            hidden_size=dyn_cfg.get("hidden_size", 256),
+        )
     else:
         dynamics = LatentDynamicsModel(
             latent_dim=cfg["latent_dim"],

@@ -37,7 +37,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from data.pixel_dataset import PixelEpisodeDataset
 from models.pixel_vae import PixelVAE
-from models.pixel_dynamics import LatentDynamicsModel
+from models.pixel_dynamics import LatentDynamicsModel, FiLMDynamicsModel
 from models.pixel_rssm import LatentRSSM
 from training.callbacks import (
     CallbackContext,
@@ -63,6 +63,8 @@ from training.pixel_loop import pixel_dynamics_train_epoch
 VALID_COMBOS = {
     ("gru", "latent_mse"),
     ("gru", "multi_step_latent"),
+    ("film", "latent_mse"),
+    ("film", "multi_step_latent"),
     ("rssm", "multi_step_latent"),
     ("rssm", "latent_elbo"),
 }
@@ -149,8 +151,8 @@ def parse_args():
 
     # --- Model architecture selection ---
     p.add_argument("--model-type", type=str, default="gru",
-                   choices=["gru", "rssm"],
-                   help="Dynamics model architecture (default: gru)")
+                   choices=["gru", "film", "rssm"],
+                   help="Dynamics model architecture: gru (concat), film (FiLM conditioning), rssm")
     p.add_argument("--training-mode", type=str, default="latent_mse",
                    choices=["latent_mse", "multi_step_latent", "latent_elbo"],
                    help="Loss function / training regime (default: latent_mse)")
@@ -311,6 +313,13 @@ def main():
             hidden_size=args.hidden_size,
         ).to(args.device)
         model_label = "LatentDynamicsModel (GRU)"
+    elif args.model_type == "film":
+        dynamics = FiLMDynamicsModel(
+            latent_dim=latent_dim,
+            action_dim=args.action_dim,
+            hidden_size=args.hidden_size,
+        ).to(args.device)
+        model_label = "FiLMDynamicsModel (GRU+FiLM)"
     elif args.model_type == "rssm":
         dynamics = LatentRSSM(
             latent_dim=latent_dim,
