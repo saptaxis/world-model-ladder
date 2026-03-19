@@ -171,6 +171,9 @@ def parse_args():
                    help="Weight on multi-step loss term")
     p.add_argument("--kl-weight", type=float, default=1.0,
                    help="KL divergence weight for latent_elbo mode")
+    p.add_argument("--free-bits", type=float, default=1.0,
+                   help="Minimum KL per stochastic dim (nats). Prevents posterior "
+                        "collapse. Dreamer uses 1.0. Set 0 to disable.")
 
     # --- Sequence / data ---
     p.add_argument("--seq-len", type=int, default=20)
@@ -201,6 +204,9 @@ def parse_args():
                    help="LR reduction factor when plateau detected")
     p.add_argument("--lr-min", type=float, default=1e-6,
                    help="Minimum LR for scheduler")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Path to checkpoint (.pt) to resume from. Restores model weights, "
+                        "optimizer state, epoch, and global_step.")
 
     args = p.parse_args()
 
@@ -257,6 +263,7 @@ def main():
         "rollout_k": args.rollout_k,
         "multi_step_weight": args.multi_step_weight,
         "kl_weight": args.kl_weight,
+        "free_bits": args.free_bits,
         "sampling_start": args.sampling_start,
         "sampling_end": args.sampling_end,
         "sampling_warmup_frac": args.sampling_warmup_frac,
@@ -324,12 +331,27 @@ def main():
 
     optimizer = torch.optim.Adam(dynamics.parameters(), lr=args.lr)
 
+    # --- Resume from checkpoint ---
+    # Restores model weights, optimizer state (including Adam momentum buffers
+    # and per-param LR), epoch counter, and global_step.
+    start_epoch = 0
+    start_step = 0
+    if args.resume:
+        print(f"Resuming from {args.resume} ...")
+        ckpt = torch.load(args.resume, map_location=args.device, weights_only=False)
+        dynamics.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", 0)
+        start_step = ckpt.get("global_step", 0)
+        print(f"  Restored epoch={start_epoch}, global_step={start_step}")
+
     # LR scheduler (optional -- only if --lr-patience > 0)
+    # Created AFTER resume so it wraps the restored optimizer state.
     scheduler = None
     if args.lr_patience > 0:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=args.lr_factor,
-            patience=args.lr_patience, min_lr=args.lr_min, verbose=True,
+            patience=args.lr_patience, min_lr=args.lr_min,
         )
         print(f"LR scheduler: ReduceLROnPlateau(patience={args.lr_patience}, "
               f"factor={args.lr_factor}, min_lr={args.lr_min})")
@@ -419,7 +441,7 @@ def main():
 
     ctx = CallbackContext(
         model=dynamics, optimizer=optimizer, writer=writer,
-        global_step=0, epoch=0, run_dir=str(dyn_dir),
+        global_step=start_step, epoch=start_epoch, run_dir=str(dyn_dir),
         device=args.device,
         extras={
             "config": config,
@@ -450,9 +472,11 @@ def main():
     for cb in callbacks:
         cb.on_train_start(ctx)
 
+    remaining = args.epochs - start_epoch
     print(f"\nTraining {model_label} ({args.training_mode}) "
-          f"for {args.epochs} epochs on {args.device}")
-    for epoch in range(args.epochs):
+          f"for {remaining} remaining epochs "
+          f"(start_epoch={start_epoch}, total={args.epochs}) on {args.device}")
+    for epoch in range(start_epoch, args.epochs):
         ctx.epoch = epoch
 
         sampling_prob = get_sampling_prob(
@@ -472,6 +496,7 @@ def main():
             rollout_k=args.rollout_k,
             kl_weight=args.kl_weight,
             ms_weight=args.multi_step_weight,
+            free_bits=args.free_bits,
         )
 
         print(f"Epoch {epoch}: train_loss={result['train_loss']:.6f} "

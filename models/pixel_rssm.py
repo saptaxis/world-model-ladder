@@ -309,11 +309,20 @@ class LatentRSSM(nn.Module):
     # KL divergence
     # ------------------------------------------------------------------
 
-    def kl_loss(self, model_state: RSSMState) -> torch.Tensor:
+    def kl_loss(self, model_state: RSSMState,
+                free_bits: float = 0.0) -> torch.Tensor:
         """Analytic KL divergence: KL(posterior || prior).
 
         Both distributions are diagonal Gaussians parameterised as
         (mean, log_std) with std = softplus(log_std) + 0.1.
+
+        Args:
+            model_state: RSSMState with both prior and posterior logits.
+            free_bits: minimum KL per stochastic dimension (in nats).
+                When > 0, clamps per-dim KL to this floor, preventing
+                posterior collapse where the stochastic branch goes unused
+                because the deterministic GRU can predict everything alone.
+                Dreamer uses free_bits=1.0. Set to 0 to disable.
 
         Raises ValueError if posterior_logits is None (prior-only state).
         """
@@ -334,11 +343,18 @@ class LatentRSSM(nn.Module):
 
         # Analytic KL for two diagonal Gaussians:
         # KL(q || p) = log(p_std/q_std) + (q_std^2 + (q_mean - p_mean)^2) / (2 * p_std^2) - 0.5
-        kl = (
+        kl_per_dim = (
             torch.log(prior_std / post_std)
             + (post_std.pow(2) + (post_mean - prior_mean).pow(2)) / (2 * prior_std.pow(2))
             - 0.5
         )
 
+        # Free bits: clamp per-dim KL to a minimum floor. This forces the
+        # stochastic branch to carry at least free_bits nats of information
+        # per dimension — without it, the deterministic GRU can handle
+        # everything and the posterior collapses onto the prior (KL → 0).
+        if free_bits > 0:
+            kl_per_dim = torch.clamp(kl_per_dim, min=free_bits)
+
         # Sum over stochastic dims, mean over batch — standard RSSM convention
-        return kl.sum(dim=-1).mean()
+        return kl_per_dim.sum(dim=-1).mean()

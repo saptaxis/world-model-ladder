@@ -62,13 +62,25 @@ def load_pixel_world_model(vae_path: str, dyn_path: str,
 
     # Dynamics model uses latent_dim from the VAE config (must match) and
     # its own action_dim/hidden_size from its checkpoint config.
+    # Dispatch on model_type in the config to support both GRU and RSSM.
     dyn_ckpt = torch.load(dyn_path, map_location=device, weights_only=False)
     dyn_cfg = dyn_ckpt["config"]
-    dynamics = LatentDynamicsModel(
-        latent_dim=cfg["latent_dim"],
-        action_dim=dyn_cfg.get("action_dim", 2),
-        hidden_size=dyn_cfg.get("hidden_size", 256),
-    )
+    model_type = dyn_cfg.get("model_type", "gru")
+    if model_type == "rssm":
+        from models.pixel_rssm import LatentRSSM
+        dynamics = LatentRSSM(
+            latent_dim=cfg["latent_dim"],
+            action_dim=dyn_cfg.get("action_dim", 2),
+            deter_dim=dyn_cfg.get("deter_dim", 200),
+            stoch_dim=dyn_cfg.get("stoch_dim", 30),
+            hidden_dim=dyn_cfg.get("hidden_size", 200),
+        )
+    else:
+        dynamics = LatentDynamicsModel(
+            latent_dim=cfg["latent_dim"],
+            action_dim=dyn_cfg.get("action_dim", 2),
+            hidden_size=dyn_cfg.get("hidden_size", 256),
+        )
     dynamics.load_state_dict(dyn_ckpt["model_state_dict"])
 
     # Compose VAE + dynamics into a single PixelWorldModel for the dream API
@@ -118,17 +130,20 @@ def dream_with_regrounding(model: PixelWorldModel, gt_frames: np.ndarray,
     # Encode the first real frame into latent space as the dream seed.
     # Shape: (1, latent_dim) — unsqueeze adds batch and channel dims for
     # the VAE encoder which expects (B, C, H, W).
-    seed_tensor = torch.from_numpy(gt_frames[0]).float().unsqueeze(0).unsqueeze(0) / 255.0
+    # Move input tensors to same device as model — model.to(device) only
+    # moves parameters, not the data we feed in.
+    device = next(model.parameters()).device
+    seed_tensor = torch.from_numpy(gt_frames[0]).float().unsqueeze(0).unsqueeze(0).to(device) / 255.0
     z = model.vae.encode(seed_tensor)
     hidden = None  # GRU hidden state starts fresh for each dream
 
     # Decode the seed latent to get frame 0 of the dream — this shows how
     # much information the VAE retains (useful baseline for the comparison).
-    decoded = model.vae.decode(z).squeeze().detach().numpy()
+    decoded = model.vae.decode(z).squeeze().detach().cpu().numpy()
     dreamed.append((decoded * 255).clip(0, 255).astype(np.uint8))
 
     for t in range(n):
-        action = torch.from_numpy(actions[t]).float().unsqueeze(0)
+        action = torch.from_numpy(actions[t]).float().unsqueeze(0).to(device)
 
         # Re-grounding: periodically replace the predicted latent with the
         # real frame's encoding. This bounds error accumulation and lets us
@@ -136,7 +151,7 @@ def dream_with_regrounding(model: PixelWorldModel, gt_frames: np.ndarray,
         # hidden=None resets the GRU state since the re-grounded latent may
         # be inconsistent with the accumulated hidden state.
         if reground_every > 0 and t > 0 and t % reground_every == 0:
-            real_tensor = torch.from_numpy(gt_frames[t]).float().unsqueeze(0).unsqueeze(0) / 255.0
+            real_tensor = torch.from_numpy(gt_frames[t]).float().unsqueeze(0).unsqueeze(0).to(device) / 255.0
             z = model.vae.encode(real_tensor)
             hidden = None
 
@@ -144,7 +159,7 @@ def dream_with_regrounding(model: PixelWorldModel, gt_frames: np.ndarray,
             # Step the dynamics model one timestep forward in latent space
             z_next, hidden = model.dynamics(z, action, hidden)
             # Decode predicted latent to pixel space for the output video
-            frame = model.vae.decode(z_next).squeeze().detach().numpy()
+            frame = model.vae.decode(z_next).squeeze().detach().cpu().numpy()
             # Feed the predicted latent forward (autoregressive rollout)
             z = z_next
 
@@ -176,6 +191,28 @@ def save_comparison_mp4(gt: np.ndarray, dreamed: np.ndarray,
     writer.close()
 
 
+def discover_policies(data_path: str) -> list[str]:
+    """Auto-discover policy/trajectory subdirs that contain .npz episodes.
+
+    Scans immediate subdirs of data_path for any that contain episode .npz
+    files. Skips non-episode dirs (cache/, __pycache__/, etc.) by checking
+    for actual .npz files inside.
+    """
+    policies = []
+    root = Path(data_path)
+    for subdir in sorted(root.iterdir()):
+        if not subdir.is_dir():
+            continue
+        # Skip known non-episode dirs
+        if subdir.name in ("cache", "__pycache__", "prepared-npy"):
+            continue
+        # Check if this dir actually contains episode npz files
+        npz_files = list(subdir.glob("episode_*.npz"))
+        if npz_files:
+            policies.append(subdir.name)
+    return policies
+
+
 def find_episodes(data_path: str, policy: str, n_episodes: int) -> list[Path]:
     """Find episode .npz files for a given policy subdirectory."""
     policy_dir = Path(data_path) / policy
@@ -199,8 +236,9 @@ def main():
                         help="Directory with policy subdirs (heuristic/, random/)")
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--policies", type=str, nargs="+",
-                        default=["heuristic", "random"],
-                        help="Policy subdirectories to use")
+                        default=None,
+                        help="Policy subdirectories to use. If not specified, "
+                             "auto-discovers all subdirs containing .npz episodes.")
     parser.add_argument("--n-episodes", type=int, default=5,
                         help="Number of episodes per policy")
     parser.add_argument("--reground", type=int, nargs="+", default=[0],
@@ -221,8 +259,12 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Auto-discover policies if none specified — finds all subdirs with .npz files
+    policies = args.policies or discover_policies(args.data_path)
+    print(f"  Policies: {policies} ({args.n_episodes} episodes each)")
+
     total_videos = 0
-    for policy in args.policies:
+    for policy in policies:
         episodes = find_episodes(args.data_path, policy, args.n_episodes)
         if not episodes:
             print(f"No episodes found for policy '{policy}' in {args.data_path}")

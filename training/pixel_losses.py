@@ -113,22 +113,39 @@ def latent_dynamics_loss(z_pred: torch.Tensor,
 def multi_step_latent_loss(dynamics: torch.nn.Module,
                            z_seq: torch.Tensor,
                            actions: torch.Tensor,
-                           k: int) -> torch.Tensor:
-    """k-step autoregressive loss with full gradient flow.
+                           k: int,
+                           teacher_forcing: float = 0.0,
+                           ) -> torch.Tensor:
+    """k-step loss with full gradient flow and optional scheduled sampling.
 
-    Rolls out k steps from z_seq[:, 0] using dynamics.rollout() and
-    computes MSE at every step against encoded-GT z. Unlike
-    predict_sequence() which detaches own predictions, rollout() keeps
-    the full computation graph — gradients flow through the entire
-    autoregressive chain, teaching the model to produce z's that work
-    as inputs for future steps.
+    Rolls out k steps from z_seq[:, 0], computing MSE at every step
+    against encoded-GT z. Gradients flow through the full autoregressive
+    chain (NO detach), teaching the model to produce z's that work as
+    inputs for future steps.
+
+    When teacher_forcing > 0, some steps randomly receive GT z instead
+    of the model's own prediction. This acts as a gradient chain
+    curriculum: at teacher_forcing=0.5, expected autoregressive chain
+    length is ~2 steps (geometric distribution); at 0.0, it's the full
+    k steps. Annealing from high to low teacher_forcing provides stable
+    early training followed by full BPTT.
+
+    Unlike predict_sequence() which detaches own predictions, here
+    gradients ALWAYS flow through model predictions when they're used
+    as input — this is standard scheduled sampling (Bengio et al. 2015)
+    and matches Dreamer's BPTT training.
 
     Args:
-        dynamics: model with rollout(z_start, actions) -> (z_seq, state).
+        dynamics: model with forward(z, action, state) -> (z_next, state).
             Both LatentDynamicsModel (GRU) and LatentRSSM implement this.
         z_seq: (B, T, latent_dim) encoded GT latent sequence.
         actions: (B, T-1, action_dim) actions between frames.
         k: rollout horizon. Clamped to min(k, T-1, len(actions)).
+        teacher_forcing: probability of using GT z instead of model's
+            own prediction at each step. 0.0 = pure autoregressive
+            (original behavior), 1.0 = fully teacher-forced (each step
+            independent). Values in between provide scheduled sampling
+            with gradient flow.
 
     Returns:
         Scalar MSE loss averaged over all k steps and batch.
@@ -139,12 +156,36 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
     # when caller requests a horizon longer than the episode
     k = min(k, T - 1, n_actions)
 
-    # Autoregressive rollout from seed z_0 — full gradient flow
-    # rollout() returns (B, k+1, D) including the seed frame at index 0
-    z_pred, _ = dynamics.rollout(z_seq[:, 0], actions[:, :k])
-    # Compare predicted latents (skip seed) to ground-truth targets
-    # MSE averaged over batch, time steps, and latent dims
-    return F.mse_loss(z_pred[:, 1:], z_seq[:, 1:k + 1])
+    if teacher_forcing == 0.0:
+        # Pure autoregressive — use rollout() for efficiency (single call,
+        # no per-step branching). This is the common fast path.
+        z_pred, _ = dynamics.rollout(z_seq[:, 0], actions[:, :k])
+        return F.mse_loss(z_pred[:, 1:], z_seq[:, 1:k + 1])
+
+    # Scheduled sampling with gradient flow — manual loop so we can
+    # randomly substitute GT z at each step while keeping gradients
+    # flowing through the autoregressive segments.
+    z = z_seq[:, 0]
+    state = None
+    z_preds = []
+
+    for t in range(k):
+        z_next, state = dynamics.forward(z, actions[:, t], state)
+        z_preds.append(z_next)
+
+        if t < k - 1:
+            # Randomly choose GT or own prediction as next input.
+            # When using own prediction: NO detach — gradients flow
+            # through the chain. When using GT: chain breaks here,
+            # but the prediction at step t still gets gradient from
+            # its own loss term.
+            if torch.rand(1).item() < teacher_forcing:
+                z = z_seq[:, t + 1]  # GT — breaks gradient chain
+            else:
+                z = z_next           # Own prediction — gradient flows
+
+    z_pred = torch.stack(z_preds, dim=1)  # (B, k, latent_dim)
+    return F.mse_loss(z_pred, z_seq[:, 1:k + 1])
 
 
 def latent_elbo_loss(model: torch.nn.Module,
@@ -152,6 +193,7 @@ def latent_elbo_loss(model: torch.nn.Module,
                      actions: torch.Tensor,
                      k: int,
                      kl_weight: float = 1.0,
+                     free_bits: float = 0.0,
                      return_breakdown: bool = False,
                      ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """ELBO loss for latent RSSM: reconstruction MSE + KL(posterior || prior).
@@ -172,6 +214,9 @@ def latent_elbo_loss(model: torch.nn.Module,
         actions: (B, T-1, action_dim) actions between frames.
         k: number of steps. Clamped to min(k, T-1, len(actions)).
         kl_weight: scalar weight for KL divergence term.
+        free_bits: minimum KL per stochastic dimension (nats). Prevents
+            posterior collapse by ensuring the stochastic branch carries at
+            least this much information. Dreamer uses 1.0. Set 0 to disable.
         return_breakdown: if True, return (total, recon_loss, kl_loss).
 
     Returns:
@@ -194,8 +239,9 @@ def latent_elbo_loss(model: torch.nn.Module,
         z_next_pred, model_state = model.step(z_seq[:, t], actions[:, t], model_state)
         # Reconstruction: how well z_{t+1}_pred matches actual z_{t+1}
         recon_terms.append(F.mse_loss(z_next_pred, z_seq[:, t + 1]))
-        # KL(posterior || prior): ensures prior can dream without observations
-        kl_terms.append(model.kl_loss(model_state))
+        # KL(posterior || prior): ensures prior can dream without observations.
+        # free_bits prevents collapse by clamping per-dim KL to a floor.
+        kl_terms.append(model.kl_loss(model_state, free_bits=free_bits))
 
     # Average over time steps — treats each step equally regardless of k
     recon_loss = torch.stack(recon_terms).mean()

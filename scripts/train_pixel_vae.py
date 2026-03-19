@@ -88,6 +88,9 @@ def parse_args():
     # channel cost.
     p.add_argument("--grayscale", action="store_true", default=True)
     p.add_argument("--no-grayscale", dest="grayscale", action="store_false")
+    p.add_argument("--resume", type=str, default=None,
+                   help="Path to checkpoint (.pt) to resume from. Restores model weights, "
+                        "optimizer state, epoch, and global_step.")
     return p.parse_args()
 
 
@@ -154,6 +157,20 @@ def main():
 
     optimizer = torch.optim.Adam(vae.parameters(), lr=args.lr)
 
+    # --- Resume from checkpoint ---
+    # Restores model weights, optimizer state (including momentum buffers and
+    # LR), epoch counter, and global_step so training continues seamlessly.
+    start_epoch = 0
+    start_step = 0
+    if args.resume:
+        print(f"Resuming from {args.resume} ...")
+        ckpt = torch.load(args.resume, map_location=args.device, weights_only=False)
+        vae.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_epoch = ckpt.get("epoch", 0)
+        start_step = ckpt.get("global_step", 0)
+        print(f"  Restored epoch={start_epoch}, global_step={start_step}")
+
     # LR scheduler (optional) — ReduceLROnPlateau lowers the learning rate
     # when val loss plateaus, which helps squeeze out final reconstruction
     # quality. Disabled by default (lr_patience=0) because most runs
@@ -162,7 +179,7 @@ def main():
     if args.lr_patience > 0:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=args.lr_factor,
-            patience=args.lr_patience, min_lr=args.lr_min, verbose=True,
+            patience=args.lr_patience, min_lr=args.lr_min,
         )
         print(f"LR scheduler: ReduceLROnPlateau(patience={args.lr_patience}, "
               f"factor={args.lr_factor}, min_lr={args.lr_min})")
@@ -220,7 +237,7 @@ def main():
 
     ctx = CallbackContext(
         model=vae, optimizer=optimizer, writer=writer,
-        global_step=0, epoch=0, run_dir=str(vae_dir),
+        global_step=start_step, epoch=start_epoch, run_dir=str(vae_dir),
         device=args.device,
         extras={"config": config},
     )
@@ -252,8 +269,10 @@ def main():
     for cb in callbacks:
         cb.on_train_start(ctx)
 
-    print(f"\nTraining VAE for {args.epochs} epochs on {args.device}")
-    for epoch in range(args.epochs):
+    remaining = args.epochs - start_epoch
+    print(f"\nTraining VAE for {remaining} remaining epochs "
+          f"(start_epoch={start_epoch}, total={args.epochs}) on {args.device}")
+    for epoch in range(start_epoch, args.epochs):
         ctx.epoch = epoch
         result = pixel_vae_train_epoch(
             vae, train_loader, optimizer,

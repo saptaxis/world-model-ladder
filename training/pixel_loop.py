@@ -115,7 +115,8 @@ def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
                                training_mode: str = "latent_mse",
                                rollout_k: int = 1,
                                kl_weight: float = 1.0,
-                               ms_weight: float = 1.0) -> dict:
+                               ms_weight: float = 1.0,
+                               free_bits: float = 0.0) -> dict:
     """One dynamics training epoch with frozen VAE and callback dispatch.
 
     Supports three training modes via loss dispatch:
@@ -175,15 +176,22 @@ def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
             # (which calls imagine_step(), no posterior). This skips the
             # RSSM's posterior/KL machinery entirely — useful as a
             # prior-only ablation. Use latent_elbo for full RSSM training.
+            # sampling_prob = P(use own prediction). For multi-step:
+            # 1.0 (default after warmup) = pure autoregressive with full
+            # gradient flow. Lower values mix in GT z at some steps,
+            # acting as a gradient chain curriculum (Bengio et al. 2015).
+            # teacher_forcing = P(use GT) = 1 - sampling_prob.
             loss = multi_step_latent_loss(
-                model_dynamics, z_seq, actions, k=rollout_k) * ms_weight
+                model_dynamics, z_seq, actions, k=rollout_k,
+                teacher_forcing=1.0 - sampling_prob) * ms_weight
 
         elif training_mode == "latent_elbo":
             # Full RSSM ELBO: posterior-guided step + KL(posterior || prior)
             # Returns breakdown for detailed logging of recon vs KL components
             loss, recon_loss, kl_loss = latent_elbo_loss(
                 model_dynamics, z_seq, actions, k=rollout_k,
-                kl_weight=kl_weight, return_breakdown=True)
+                kl_weight=kl_weight, free_bits=free_bits,
+                return_breakdown=True)
 
         else:
             raise ValueError(
