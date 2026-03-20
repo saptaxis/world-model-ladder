@@ -115,8 +115,6 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
                            actions: torch.Tensor,
                            k: int,
                            teacher_forcing: float = 0.0,
-                           kin_weight: float = 1.0,
-                           kin_dims: int = 6,
                            ) -> torch.Tensor:
     """k-step loss with full gradient flow and optional scheduled sampling.
 
@@ -148,14 +146,6 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
             (original behavior), 1.0 = fully teacher-forced (each step
             independent). Values in between provide scheduled sampling
             with gradient flow.
-        kin_weight: multiplier for MSE on the first kin_dims dimensions
-            of z. Default 1.0 = uniform weighting. Set higher (e.g. 8-10)
-            to make the loss prioritize kinematic dims over appearance.
-            Without this, 6 kinematic dims are ~11% of the 64-dim loss —
-            the model can ignore physics and still get low loss by
-            predicting static appearance correctly.
-        kin_dims: number of leading z dimensions that are kinematic.
-            Default 6 = (x, y, vx, vy, angle, ang_vel).
 
     Returns:
         Scalar MSE loss averaged over all k steps and batch.
@@ -166,34 +156,11 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
     # when caller requests a horizon longer than the episode
     k = min(k, T - 1, n_actions)
 
-    # Build per-dim weight vector. Kinematic dims get kin_weight multiplier,
-    # appearance dims get 1.0. This makes the loss prioritize physics when
-    # kin_weight > 1. With kin_weight=1.0 (default), this is standard MSE.
-    if kin_weight != 1.0 and kin_dims > 0:
-        latent_dim = z_seq.size(-1)
-        dim_weights = torch.ones(latent_dim, device=z_seq.device)
-        dim_weights[:kin_dims] = kin_weight
-        # Normalize so total loss scale stays comparable across kin_weight values.
-        # Without normalization, kin_weight=10 would inflate the total loss ~2x
-        # (6 dims * 10 + 58 dims * 1 = 118 vs 64), making LR/patience incomparable.
-        dim_weights = dim_weights / dim_weights.mean()
-    else:
-        dim_weights = None
-
-    def _weighted_mse(pred, target):
-        """MSE with optional per-dim weighting on kinematic dims."""
-        if dim_weights is None:
-            return F.mse_loss(pred, target)
-        # (pred - target)^2 has shape (..., latent_dim)
-        # dim_weights broadcasts over batch and time dims
-        sq_err = (pred - target).pow(2)
-        return (sq_err * dim_weights).mean()
-
     if teacher_forcing == 0.0:
         # Pure autoregressive — use rollout() for efficiency (single call,
         # no per-step branching). This is the common fast path.
         z_pred, _ = dynamics.rollout(z_seq[:, 0], actions[:, :k])
-        return _weighted_mse(z_pred[:, 1:], z_seq[:, 1:k + 1])
+        return F.mse_loss(z_pred[:, 1:], z_seq[:, 1:k + 1])
 
     # Scheduled sampling with gradient flow — manual loop so we can
     # randomly substitute GT z at each step while keeping gradients
@@ -218,7 +185,7 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
                 z = z_next           # Own prediction — gradient flows
 
     z_pred = torch.stack(z_preds, dim=1)  # (B, k, latent_dim)
-    return _weighted_mse(z_pred, z_seq[:, 1:k + 1])
+    return F.mse_loss(z_pred, z_seq[:, 1:k + 1])
 
 
 def latent_elbo_loss(model: torch.nn.Module,
