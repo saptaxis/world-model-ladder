@@ -418,24 +418,67 @@ class PixelFrameDataset(Dataset):
                 str(states_file), mode='w+', dtype=np.float32,
                 shape=(total_frames, state_dim))
 
-        # Fill the mmap one episode at a time — peak RAM is one episode
+        # Fill the mmap using parallel workers. Each worker loads one episode,
+        # preprocesses its frames (decompress npz + resize + grayscale — CPU heavy),
+        # and returns the preprocessed arrays. The main thread writes to the mmap
+        # sequentially. Peak RAM = n_workers episodes in flight (~few MB each).
         offset = 0
-        for i, path in enumerate(tqdm(episode_files, desc="Building cache", unit="ep")):
-            n = frame_counts[i]
-            if n == 0:
-                continue
-            try:
-                with np.load(str(path), allow_pickle=True) as data:
-                    raw_frames = data["rgb_frames"]
-                    for j in range(n):
-                        frame = _preprocess_frame(raw_frames[j], frame_size, grayscale)
-                        frames_mmap[offset + j] = frame
-                    if states_mmap is not None and "states" in data:
-                        states = data["states"][:n, :state_dim].astype(np.float32)
-                        states_mmap[offset:offset + n] = states
-                offset += n
-            except Exception:
-                offset += n  # skip but keep alignment
+        load_workers = max(1, n_workers)
+
+        if load_workers > 1:
+            from multiprocessing import Pool
+
+            # Build args: each worker gets (path, frame_size, grayscale, state_dim)
+            # and returns preprocessed (frames, states_or_None)
+            worker_args = []
+            for i, path in enumerate(episode_files):
+                if frame_counts[i] > 0:
+                    if state_dim > 0:
+                        worker_args.append((path, frame_size, grayscale, state_dim))
+                    else:
+                        worker_args.append((path, frame_size, grayscale))
+
+            # Use the existing worker functions — they return preprocessed arrays
+            worker_fn = _load_one_episode_states if state_dim > 0 else _load_one_episode
+
+            with Pool(load_workers) as pool:
+                for result in tqdm(
+                    pool.imap(worker_fn, worker_args),
+                    total=len(worker_args), desc="Building cache", unit="ep",
+                ):
+                    if state_dim > 0:
+                        frames, states = result
+                    else:
+                        frames = result
+                        states = None
+
+                    if frames is None:
+                        continue
+                    n = len(frames)
+                    # Write this episode's preprocessed frames to the mmap
+                    frames_mmap[offset:offset + n] = frames
+                    if states_mmap is not None and states is not None:
+                        states_mmap[offset:offset + n] = states[:n, :state_dim]
+                    offset += n
+                    # frames/states go out of scope here — GC reclaims per iteration
+        else:
+            # Single-threaded fallback
+            for i, path in enumerate(tqdm(episode_files, desc="Building cache", unit="ep")):
+                n = frame_counts[i]
+                if n == 0:
+                    continue
+                try:
+                    with np.load(str(path), allow_pickle=True) as data:
+                        raw_frames = data["rgb_frames"]
+                        for j in range(n):
+                            frame = _preprocess_frame(raw_frames[j], frame_size, grayscale)
+                            frames_mmap[offset + j] = frame
+                        if states_mmap is not None and "states" in data:
+                            states = data["states"][:n, :state_dim].astype(np.float32)
+                            states_mmap[offset:offset + n] = states
+                    offset += n
+                except Exception:
+                    offset += n  # skip but keep alignment
 
         # Flush to disk
         del frames_mmap
