@@ -116,7 +116,9 @@ def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
                                rollout_k: int = 1,
                                kl_weight: float = 1.0,
                                ms_weight: float = 1.0,
-                               free_bits: float = 0.0) -> dict:
+                               free_bits: float = 0.0,
+                               kin_weight: float = 1.0,
+                               kin_dims: int = 6) -> dict:
     """One dynamics training epoch with frozen VAE and callback dispatch.
 
     Supports three training modes via loss dispatch:
@@ -183,7 +185,8 @@ def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
             # teacher_forcing = P(use GT) = 1 - sampling_prob.
             loss = multi_step_latent_loss(
                 model_dynamics, z_seq, actions, k=rollout_k,
-                teacher_forcing=1.0 - sampling_prob) * ms_weight
+                teacher_forcing=1.0 - sampling_prob,
+                kin_weight=kin_weight, kin_dims=kin_dims) * ms_weight
 
         elif training_mode == "latent_elbo":
             # Full RSSM ELBO: posterior-guided step + KL(posterior || prior)

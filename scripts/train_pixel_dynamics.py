@@ -176,6 +176,12 @@ def parse_args():
     p.add_argument("--free-bits", type=float, default=1.0,
                    help="Minimum KL per stochastic dim (nats). Prevents posterior "
                         "collapse. Dreamer uses 1.0. Set 0 to disable.")
+    p.add_argument("--kin-weight", type=float, default=1.0,
+                   help="Multiplier for MSE on kinematic z dims (first --kin-dims). "
+                        "Default 1.0 = uniform. Set 8-10 to prioritize physics. "
+                        "Without this, 6 kin dims are ~11%% of 64-dim loss.")
+    p.add_argument("--kin-dims", type=int, default=6,
+                   help="Number of leading z dims that are kinematic (default 6).")
 
     # --- Sequence / data ---
     p.add_argument("--seq-len", type=int, default=20)
@@ -266,6 +272,8 @@ def main():
         "multi_step_weight": args.multi_step_weight,
         "kl_weight": args.kl_weight,
         "free_bits": args.free_bits,
+        "kin_weight": args.kin_weight,
+        "kin_dims": args.kin_dims,
         "sampling_start": args.sampling_start,
         "sampling_end": args.sampling_end,
         "sampling_warmup_frac": args.sampling_warmup_frac,
@@ -506,6 +514,8 @@ def main():
             kl_weight=args.kl_weight,
             ms_weight=args.multi_step_weight,
             free_bits=args.free_bits,
+            kin_weight=args.kin_weight,
+            kin_dims=args.kin_dims,
         )
 
         print(f"Epoch {epoch}: train_loss={result['train_loss']:.6f} "
