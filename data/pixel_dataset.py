@@ -225,6 +225,29 @@ class PixelFrameDataset(Dataset):
                 print(f"PixelFrameDataset: {n} frames{state_str} ({disk_mb:.0f} MB on disk, mmap)")
                 return
 
+        # --- Try streaming cache build (low-memory) ---
+        # For large datasets at high resolution (e.g., 19K episodes at 128x128),
+        # loading all frames into RAM first causes OOM (~70GB). Instead, process
+        # episodes one at a time and write directly to a pre-allocated mmap file.
+        # Only used when cache_path is given and cache doesn't exist yet.
+        if cache_path is not None and not Path(cache_path).is_dir():
+            self._build_cache_streaming(
+                data_path, cache_path, frame_size, grayscale, split,
+                val_fraction, seed, n_workers, state_dim)
+            # Now load from the freshly-built cache via mmap (top of __init__)
+            frames_file = Path(cache_path) / "frames.npy"
+            if frames_file.exists():
+                self._frames = np.load(str(frames_file), mmap_mode='r')
+                if state_dim > 0:
+                    states_file = Path(cache_path) / "states.npy"
+                    if states_file.exists():
+                        self._states = np.load(str(states_file), mmap_mode='r')
+                n = self._frames.shape[0]
+                disk_mb = os.path.getsize(str(frames_file)) / 1024 / 1024
+                state_str = f" + {state_dim}D states" if self._states is not None else ""
+                print(f"PixelFrameDataset: {n} frames{state_str} ({disk_mb:.0f} MB on disk, mmap)")
+                return
+
         # --- Full load path (no cache or cache miss) ---
         # Normalize to list of paths so callers can pass a single string or
         # multiple data directories (e.g., heuristic + random episodes).
@@ -322,6 +345,103 @@ class PixelFrameDataset(Dataset):
                 del self._states
                 self._states = np.load(str(states_file), mmap_mode='r')
             print(f"Reloaded as mmap (RAM freed)")
+
+    def _build_cache_streaming(
+        self, data_path, cache_path, frame_size, grayscale,
+        split, val_fraction, seed, n_workers, state_dim,
+    ):
+        """Build the frame cache without loading all episodes into RAM.
+
+        Processes episodes one at a time: load npz → preprocess → write
+        directly to a pre-allocated numpy mmap file. Peak RAM usage is
+        one episode (~a few MB), not the entire dataset (~70GB at 128x128).
+
+        Two passes:
+        1. Count total frames (fast — just read npz metadata)
+        2. Process episodes and write to mmap
+        """
+        # Resolve episode files (same logic as full load path)
+        if isinstance(data_path, (str, Path)):
+            data_path = [data_path]
+        npz_files = []
+        for dp in data_path:
+            for root, _dirs, files in os.walk(str(Path(dp)), followlinks=True):
+                for f in files:
+                    if f.endswith(".npz"):
+                        npz_files.append(Path(root) / f)
+        npz_files.sort()
+        npz_files = [f for f in npz_files if "prepared" not in f.name]
+        episode_files = _split_episodes(npz_files, split, val_fraction, seed)
+
+        if not episode_files:
+            return
+
+        # Pass 1: count total frames across all episodes
+        # Read only rgb_frames shape from each npz — fast, no decompression
+        print(f"Streaming cache build: counting frames in {len(episode_files)} episodes...")
+        total_frames = 0
+        frame_counts = []
+        for path in tqdm(episode_files, desc="Counting", unit="ep"):
+            try:
+                with np.load(str(path)) as data:
+                    n = data["rgb_frames"].shape[0]
+                    frame_counts.append(n)
+                    total_frames += n
+            except Exception:
+                frame_counts.append(0)
+
+        if total_frames == 0:
+            return
+
+        # Pass 2: allocate mmap file and fill it episode by episode
+        cache_dir = Path(cache_path)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        frames_file = cache_dir / "frames.npy"
+        states_file = cache_dir / "states.npy"
+
+        # Pre-allocate the output arrays as mmap files.
+        # np.lib.format.open_memmap creates a .npy file with the right
+        # header and returns a writable mmap view.
+        if grayscale:
+            frame_shape = (total_frames, frame_size, frame_size)
+        else:
+            frame_shape = (total_frames, frame_size, frame_size, 3)
+
+        print(f"Allocating {frames_file} ({total_frames} frames, "
+              f"{np.prod(frame_shape) / 1e9:.1f} GB)...")
+        frames_mmap = np.lib.format.open_memmap(
+            str(frames_file), mode='w+', dtype=np.uint8, shape=frame_shape)
+
+        states_mmap = None
+        if state_dim > 0:
+            states_mmap = np.lib.format.open_memmap(
+                str(states_file), mode='w+', dtype=np.float32,
+                shape=(total_frames, state_dim))
+
+        # Fill the mmap one episode at a time — peak RAM is one episode
+        offset = 0
+        for i, path in enumerate(tqdm(episode_files, desc="Building cache", unit="ep")):
+            n = frame_counts[i]
+            if n == 0:
+                continue
+            try:
+                with np.load(str(path), allow_pickle=True) as data:
+                    raw_frames = data["rgb_frames"]
+                    for j in range(n):
+                        frame = _preprocess_frame(raw_frames[j], frame_size, grayscale)
+                        frames_mmap[offset + j] = frame
+                    if states_mmap is not None and "states" in data:
+                        states = data["states"][:n, :state_dim].astype(np.float32)
+                        states_mmap[offset:offset + n] = states
+                offset += n
+            except Exception:
+                offset += n  # skip but keep alignment
+
+        # Flush to disk
+        del frames_mmap
+        if states_mmap is not None:
+            del states_mmap
+        print(f"Streaming cache complete: {total_frames} frames → {cache_dir}")
 
     def __len__(self) -> int:
         return self._frames.shape[0]
