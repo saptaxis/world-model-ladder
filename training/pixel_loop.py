@@ -116,7 +116,9 @@ def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
                                rollout_k: int = 1,
                                kl_weight: float = 1.0,
                                ms_weight: float = 1.0,
-                               free_bits: float = 0.0) -> dict:
+                               free_bits: float = 0.0,
+                               kin_weight: float = 1.0,
+                               kin_dims: int = 6) -> dict:
     """One dynamics training epoch with frozen VAE and callback dispatch.
 
     Supports three training modes via loss dispatch:
@@ -168,7 +170,19 @@ def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
             # predict_sequence handles T actions for T frames (legacy convention)
             z_pred, _ = model_dynamics.predict_sequence(
                 z_seq, actions, teacher_forcing=1.0 - sampling_prob)
-            loss = latent_dynamics_loss(z_pred[:, :-1], z_seq[:, 1:])
+            # Weighted MSE on latent dims — same logic as multi_step_latent.
+            # Upweights first kin_dims dimensions when kin_weight > 1, so
+            # the dynamics model prioritizes getting kinematics right.
+            if kin_weight != 1.0 and kin_dims > 0:
+                latent_dim = z_seq.size(-1)
+                dim_weights = torch.ones(latent_dim, device=z_seq.device)
+                dim_weights[:kin_dims] = kin_weight
+                # Normalize so mean weight = 1 — keeps loss magnitude comparable
+                dim_weights = dim_weights / dim_weights.mean()
+                sq_err = (z_pred[:, :-1] - z_seq[:, 1:]).pow(2)
+                loss = (sq_err * dim_weights).mean()
+            else:
+                loss = latent_dynamics_loss(z_pred[:, :-1], z_seq[:, 1:])
 
         elif training_mode == "multi_step_latent":
             # Autoregressive rollout with full gradient flow through k steps.
@@ -183,7 +197,8 @@ def pixel_dynamics_train_epoch(model_dynamics, vae, train_loader, optimizer,
             # teacher_forcing = P(use GT) = 1 - sampling_prob.
             loss = multi_step_latent_loss(
                 model_dynamics, z_seq, actions, k=rollout_k,
-                teacher_forcing=1.0 - sampling_prob) * ms_weight
+                teacher_forcing=1.0 - sampling_prob,
+                kin_weight=kin_weight, kin_dims=kin_dims) * ms_weight
 
         elif training_mode == "latent_elbo":
             # Full RSSM ELBO: posterior-guided step + KL(posterior || prior)

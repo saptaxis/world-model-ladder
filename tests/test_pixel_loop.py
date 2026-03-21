@@ -78,6 +78,26 @@ class TestPixelDynamicsTrainEpoch:
         assert "train_loss" in result
         assert result["train_loss"] > 0
 
+    def test_multi_step_latent_with_kin_weight(self):
+        """Training epoch with kin_weight > 1 runs without error."""
+        vae = PixelVAE(in_channels=1, latent_dim=8, frame_size=64,
+                       channels=[8, 16, 32, 64])
+        vae.eval()
+        for p in vae.parameters():
+            p.requires_grad_(False)
+        dynamics = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        optimizer = torch.optim.Adam(dynamics.parameters(), lr=1e-3)
+        frames = torch.rand(2, 10, 1, 64, 64)
+        actions = torch.randn(2, 9, 2)
+        loader = [(frames, actions)]
+        result = pixel_dynamics_train_epoch(
+            dynamics, vae, loader, optimizer,
+            training_mode="multi_step_latent", rollout_k=4,
+            kin_weight=10.0, kin_dims=3,
+            device="cpu")
+        assert "train_loss" in result
+        assert result["train_loss"] > 0
+
     def test_latent_elbo_mode(self):
         """Training epoch with latent_elbo mode returns loss dict with KL."""
         from models.pixel_rssm import LatentRSSM

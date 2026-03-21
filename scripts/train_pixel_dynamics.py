@@ -200,6 +200,13 @@ def parse_args():
     p.add_argument("--free-bits", type=float, default=1.0,
                    help="Minimum KL per stochastic dim (nats). Prevents posterior "
                         "collapse. Dreamer uses 1.0. Set 0 to disable.")
+    p.add_argument("--kin-weight", type=float, default=1.0,
+                   help="Upweight factor for z[0:kin_dims] in dynamics loss. "
+                        "Only valid with factored VAE (z_kin dims are known). "
+                        "1.0 = uniform (default). 10 = 10x weight on kinematics.")
+    p.add_argument("--kin-dims", type=int, default=6,
+                   help="Number of leading z dims to upweight. Must match "
+                        "factored VAE's len(kin_targets). Ignored if kin_weight=1.")
 
     # --- Sequence / data ---
     p.add_argument("--seq-len", type=int, default=20)
@@ -262,6 +269,16 @@ def main():
     grayscale = vae_cfg["in_channels"] == 1
     print(f"  VAE: latent_dim={latent_dim}, frame_size={frame_size}")
 
+    # Warn if kin-weight is used without a factored VAE — the first kin_dims
+    # z dimensions may not correspond to kinematics, making the weighting
+    # unprincipled (but not an error — user may know what they're doing).
+    if args.kin_weight != 1.0:
+        vae_model_type = vae_cfg.get("model_type", "standard")
+        if vae_model_type != "factored":
+            print(f"WARNING: --kin-weight={args.kin_weight} but VAE is not factored "
+                  f"(model_type={vae_model_type}). First {args.kin_dims} z dims "
+                  f"may not be kinematics — weighting is unprincipled.")
+
     # Directories -- run_dir IS the dynamics run dir (not a parent)
     dyn_dir = Path(args.run_dir)
     dyn_dir.mkdir(parents=True, exist_ok=True)
@@ -290,6 +307,8 @@ def main():
         "multi_step_weight": args.multi_step_weight,
         "kl_weight": args.kl_weight,
         "free_bits": args.free_bits,
+        "kin_weight": args.kin_weight,
+        "kin_dims": args.kin_dims,
         "sampling_start": args.sampling_start,
         "sampling_end": args.sampling_end,
         "sampling_warmup_frac": args.sampling_warmup_frac,
@@ -407,6 +426,8 @@ def main():
         "rollout_k": args.rollout_k,
         "multi_step_weight": args.multi_step_weight,
         "kl_weight": args.kl_weight,
+        "kin_weight": args.kin_weight,
+        "kin_dims": args.kin_dims,
         "vae_checkpoint": args.vae_checkpoint,
     }
 
@@ -531,6 +552,8 @@ def main():
             kl_weight=args.kl_weight,
             ms_weight=args.multi_step_weight,
             free_bits=args.free_bits,
+            kin_weight=args.kin_weight,
+            kin_dims=args.kin_dims,
         )
 
         print(f"Epoch {epoch}: train_loss={result['train_loss']:.6f} "

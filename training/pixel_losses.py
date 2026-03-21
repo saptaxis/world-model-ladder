@@ -115,6 +115,8 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
                            actions: torch.Tensor,
                            k: int,
                            teacher_forcing: float = 0.0,
+                           kin_weight: float = 1.0,
+                           kin_dims: int = 6,
                            ) -> torch.Tensor:
     """k-step loss with full gradient flow and optional scheduled sampling.
 
@@ -146,6 +148,11 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
             (original behavior), 1.0 = fully teacher-forced (each step
             independent). Values in between provide scheduled sampling
             with gradient flow.
+        kin_weight: upweight factor for z[0:kin_dims] in MSE. 1.0 = uniform
+            (default). >1 prioritizes kinematic dims in the loss. Only valid
+            with a factored VAE where z[0:kin_dims] are kinematics by construction.
+        kin_dims: number of leading z dims to upweight. Typically 6 (all
+            kinematics) or len(kin_targets).
 
     Returns:
         Scalar MSE loss averaged over all k steps and batch.
@@ -160,32 +167,51 @@ def multi_step_latent_loss(dynamics: torch.nn.Module,
         # Pure autoregressive — use rollout() for efficiency (single call,
         # no per-step branching). This is the common fast path.
         z_pred, _ = dynamics.rollout(z_seq[:, 0], actions[:, :k])
-        return F.mse_loss(z_pred[:, 1:], z_seq[:, 1:k + 1])
+        z_pred_k = z_pred[:, 1:]
+        z_target = z_seq[:, 1:k + 1]
+    else:
+        # Scheduled sampling with gradient flow — manual loop so we can
+        # randomly substitute GT z at each step while keeping gradients
+        # flowing through the autoregressive segments.
+        z = z_seq[:, 0]
+        state = None
+        z_preds = []
 
-    # Scheduled sampling with gradient flow — manual loop so we can
-    # randomly substitute GT z at each step while keeping gradients
-    # flowing through the autoregressive segments.
-    z = z_seq[:, 0]
-    state = None
-    z_preds = []
+        for t in range(k):
+            z_next, state = dynamics.forward(z, actions[:, t], state)
+            z_preds.append(z_next)
 
-    for t in range(k):
-        z_next, state = dynamics.forward(z, actions[:, t], state)
-        z_preds.append(z_next)
+            if t < k - 1:
+                # Randomly choose GT or own prediction as next input.
+                # When using own prediction: NO detach — gradients flow
+                # through the chain. When using GT: chain breaks here,
+                # but the prediction at step t still gets gradient from
+                # its own loss term.
+                if torch.rand(1).item() < teacher_forcing:
+                    z = z_seq[:, t + 1]  # GT — breaks gradient chain
+                else:
+                    z = z_next           # Own prediction — gradient flows
 
-        if t < k - 1:
-            # Randomly choose GT or own prediction as next input.
-            # When using own prediction: NO detach — gradients flow
-            # through the chain. When using GT: chain breaks here,
-            # but the prediction at step t still gets gradient from
-            # its own loss term.
-            if torch.rand(1).item() < teacher_forcing:
-                z = z_seq[:, t + 1]  # GT — breaks gradient chain
-            else:
-                z = z_next           # Own prediction — gradient flows
+        z_pred_k = torch.stack(z_preds, dim=1)  # (B, k, latent_dim)
+        z_target = z_seq[:, 1:k + 1]
 
-    z_pred = torch.stack(z_preds, dim=1)  # (B, k, latent_dim)
-    return F.mse_loss(z_pred, z_seq[:, 1:k + 1])
+    # --- Weighted MSE ---
+    # When kin_weight > 1, upweight the first kin_dims latent dimensions
+    # so the dynamics model prioritizes getting kinematics right. Only
+    # meaningful with a factored VAE where z[0:kin_dims] are kinematics
+    # by construction (position, velocity, angle).
+    if kin_weight != 1.0 and kin_dims > 0:
+        latent_dim = z_seq.size(-1)
+        # Build per-dim weight vector: kin dims get kin_weight, rest get 1.0
+        dim_weights = torch.ones(latent_dim, device=z_seq.device)
+        dim_weights[:kin_dims] = kin_weight
+        # Normalize so mean weight = 1 — keeps loss magnitude comparable
+        # across different kin_weight values, preventing LR re-tuning
+        dim_weights = dim_weights / dim_weights.mean()
+        sq_err = (z_pred_k - z_target).pow(2)
+        return (sq_err * dim_weights).mean()
+    else:
+        return F.mse_loss(z_pred_k, z_target)
 
 
 def latent_elbo_loss(model: torch.nn.Module,

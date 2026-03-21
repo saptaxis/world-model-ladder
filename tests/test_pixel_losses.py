@@ -75,6 +75,63 @@ class TestMultiStepLatentLoss:
         assert loss.dim() == 0
 
 
+class TestMultiStepLatentLossKinWeight:
+    """Tests for per-dim kinematic weighting in multi_step_latent_loss."""
+
+    def test_kin_weight_1_matches_default(self):
+        """kin_weight=1.0 produces identical loss to no weighting."""
+        model = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        z_seq = torch.randn(2, 6, 8)
+        actions = torch.randn(2, 5, 2)
+        loss_default = multi_step_latent_loss(model, z_seq, actions, k=4)
+        loss_w1 = multi_step_latent_loss(model, z_seq, actions, k=4,
+                                          kin_weight=1.0, kin_dims=3)
+        assert torch.allclose(loss_default, loss_w1, atol=1e-6)
+
+    def test_kin_weight_changes_loss(self):
+        """kin_weight != 1 produces different loss value."""
+        model = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        z_seq = torch.randn(2, 6, 8)
+        actions = torch.randn(2, 5, 2)
+        loss_w1 = multi_step_latent_loss(model, z_seq, actions, k=4,
+                                          kin_weight=1.0, kin_dims=3)
+        loss_w10 = multi_step_latent_loss(model, z_seq, actions, k=4,
+                                           kin_weight=10.0, kin_dims=3)
+        assert not torch.allclose(loss_w1, loss_w10)
+
+    def test_kin_weight_is_scalar(self):
+        """Result is still a scalar tensor."""
+        model = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        z_seq = torch.randn(2, 6, 8)
+        actions = torch.randn(2, 5, 2)
+        loss = multi_step_latent_loss(model, z_seq, actions, k=4,
+                                       kin_weight=5.0, kin_dims=3)
+        assert loss.dim() == 0
+        assert loss.item() > 0
+
+    def test_gradient_flows_with_kin_weight(self):
+        """Gradients still propagate when kin_weight is active."""
+        model = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        z_seq = torch.randn(2, 6, 8, requires_grad=True)
+        actions = torch.randn(2, 5, 2)
+        loss = multi_step_latent_loss(model, z_seq, actions, k=4,
+                                       kin_weight=10.0, kin_dims=3)
+        loss.backward()
+        assert z_seq.grad is not None
+        assert z_seq.grad[:, 0].abs().sum() > 0
+
+    def test_kin_weight_with_teacher_forcing(self):
+        """kin_weight works with scheduled sampling path too."""
+        model = LatentDynamicsModel(latent_dim=8, action_dim=2, hidden_size=16)
+        z_seq = torch.randn(2, 6, 8)
+        actions = torch.randn(2, 5, 2)
+        loss = multi_step_latent_loss(model, z_seq, actions, k=4,
+                                       teacher_forcing=0.5,
+                                       kin_weight=5.0, kin_dims=3)
+        assert loss.dim() == 0
+        assert loss.item() > 0
+
+
 class TestLatentELBOLoss:
     def test_output_is_scalar(self):
         """ELBO loss returns a scalar tensor."""
