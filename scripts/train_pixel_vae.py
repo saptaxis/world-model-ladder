@@ -94,6 +94,15 @@ def parse_args():
     p.add_argument("--coord-conv", action="store_true", default=False,
                    help="CoordConv: append x,y coordinate channels to encoder input. "
                         "Gives CNN explicit spatial info — helps with rotation/position.")
+    p.add_argument("--model-type", type=str, default="standard",
+                   choices=["standard", "factored"],
+                   help="VAE model type. 'factored' splits z into [z_kin, z_ctx].")
+    p.add_argument("--decoder-type", type=str, default="concat",
+                   choices=["concat", "film"],
+                   help="Decoder variant for factored model (ignored for standard).")
+    p.add_argument("--kin-targets", type=str, default="0,1,2,3,4,5",
+                   help="Comma-separated kinematic dim indices for z_kin. "
+                        "Default '0,1,2,3,4,5' = all 6. '4,5' = angle-only ablation.")
     return p.parse_args()
 
 
@@ -105,15 +114,41 @@ def main():
     vae_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = str(vae_dir)
 
+    # --- Parse kin_targets + compute state_targets ---
+    # kin_targets: which z dims are kinematic (for factored VAE)
+    # state_targets: which GT state dims to load from npz (for dataset)
+    # For factored model, these are the same list — the encoder must place
+    # GT state[i] into z[i] for each i in kin_targets.
+    kin_targets = [int(x) for x in args.kin_targets.split(",")]
+
+    if args.model_type == "factored":
+        # Factored model: dataset loads exactly the kin_target dims from GT states
+        state_targets = kin_targets
+        # Override state_dim to match — used for state_weight/loss gating
+        args.state_dim = len(kin_targets)
+        args.state_weight = max(args.state_weight, 1.0)  # force state loss on
+        print(f"  Factored mode: kin_targets={kin_targets}, "
+              f"state_targets={state_targets}, state_dim={args.state_dim}")
+    else:
+        # Standard model: legacy first-N slice
+        state_targets = None  # None means use state_dim int
+
     # --- Data loading ---
-    # Cache paths encode frame_size, grayscale, and state_dim so that
+    # Cache paths encode frame_size, grayscale, and state target info so that
     # different preprocessing configs don't collide in the same cache dir.
     cache_train = None
     cache_val = None
     if args.cache_dir:
         cache_dir = Path(args.cache_dir)
         gs_tag = "gray" if args.grayscale else "rgb"
-        state_tag = f"_s{args.state_dim}" if args.state_dim > 0 else ""
+        # Include state target info in cache tag so different configs
+        # don't collide. state_targets=[4,5] → "_st4_5", state_dim=6 → "_s6"
+        if state_targets is not None:
+            state_tag = f"_st{'_'.join(str(i) for i in state_targets)}"
+        elif args.state_dim > 0:
+            state_tag = f"_s{args.state_dim}"
+        else:
+            state_tag = ""
         cache_train = cache_dir / f"frames_train_{args.frame_size}_{gs_tag}{state_tag}"
         cache_val = cache_dir / f"frames_val_{args.frame_size}_{gs_tag}{state_tag}"
 
@@ -123,12 +158,14 @@ def main():
         grayscale=args.grayscale, split="train",
         n_workers=args.load_workers, cache_path=cache_train,
         state_dim=args.state_dim,
+        state_targets=state_targets,  # None for standard, list for factored
     )
     val_ds = PixelFrameDataset(
         args.data_path, frame_size=args.frame_size,
         grayscale=args.grayscale, split="val",
         n_workers=args.load_workers, cache_path=cache_val,
         state_dim=args.state_dim,
+        state_targets=state_targets,
     )
     print(f"  Train: {len(train_ds)} frames, Val: {len(val_ds)} frames")
 
@@ -146,15 +183,29 @@ def main():
     # frame-stacked inputs with multiple channels).
     grayscale_channels = 1 if args.grayscale else 3
     in_ch = args.in_channels if args.in_channels != 1 else grayscale_channels
-    vae = PixelVAE(
-        in_channels=in_ch,
-        latent_dim=args.latent_dim,
-        frame_size=args.frame_size,
-        channels=args.channels,
-        beta=args.beta,
-        state_dim=args.state_dim,
-        coord_conv=args.coord_conv,
-    ).to(args.device)
+
+    if args.model_type == "factored":
+        from models.factored_pixel_vae import FactoredPixelVAE
+        vae = FactoredPixelVAE(
+            in_channels=in_ch,
+            latent_dim=args.latent_dim,
+            frame_size=args.frame_size,
+            channels=args.channels,
+            beta=args.beta,
+            kin_targets=kin_targets,
+            decoder_type=args.decoder_type,
+            coord_conv=args.coord_conv,
+        ).to(args.device)
+    else:
+        vae = PixelVAE(
+            in_channels=in_ch,
+            latent_dim=args.latent_dim,
+            frame_size=args.frame_size,
+            channels=args.channels,
+            beta=args.beta,
+            state_dim=args.state_dim,
+            coord_conv=args.coord_conv,
+        ).to(args.device)
 
     param_count = sum(p.numel() for p in vae.parameters())
     print(f"PixelVAE: {param_count:,} parameters")
@@ -193,6 +244,9 @@ def main():
 
     # Config dict — saved to checkpoint AND config.json for reproducibility
     config = {
+        "model_type": args.model_type,
+        "decoder_type": args.decoder_type if args.model_type == "factored" else None,
+        "kin_targets": kin_targets if args.model_type == "factored" else None,
         "in_channels": in_ch,
         "latent_dim": args.latent_dim,
         "frame_size": args.frame_size,
