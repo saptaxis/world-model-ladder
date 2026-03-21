@@ -57,6 +57,7 @@ def load_pixel_world_model(vae_path: str, dyn_path: str,
         frame_size=cfg["frame_size"],
         channels=cfg.get("channels", [32, 64, 128, 256]),
         state_dim=cfg.get("state_dim", 0),
+        coord_conv=cfg.get("coord_conv", False),
     )
     vae.load_state_dict(vae_ckpt["model_state_dict"])
 

@@ -74,3 +74,71 @@ class TestPixelVAE:
         recon, _, _, _ = vae(x)
         assert recon.min() >= 0.0
         assert recon.max() <= 1.0
+
+
+class TestPixelVAECoordConv:
+    """Tests for CoordConv option — x,y coordinate channels for encoder."""
+
+    def test_forward_shape_unchanged(self):
+        """Output shapes identical with or without coord_conv."""
+        model = PixelVAE(in_channels=1, latent_dim=32, frame_size=64,
+                         channels=[4, 8, 16, 32], coord_conv=True)
+        x = torch.rand(2, 1, 64, 64)
+        recon, mu, logvar, state_pred = model(x)
+        assert recon.shape == (2, 1, 64, 64)
+        assert mu.shape == (2, 32)
+        assert logvar.shape == (2, 32)
+
+    def test_encode_decode_round_trip(self):
+        """Encode-decode produces correct shapes with coord_conv."""
+        model = PixelVAE(in_channels=1, latent_dim=32, frame_size=64,
+                         channels=[4, 8, 16, 32], coord_conv=True)
+        x = torch.rand(2, 1, 64, 64)
+        z = model.encode(x)
+        assert z.shape == (2, 32)
+        recon = model.decode(z)
+        assert recon.shape == (2, 1, 64, 64)
+
+    def test_coord_conv_more_params_than_standard(self):
+        """coord_conv adds parameters to the first encoder conv layer."""
+        kwargs = dict(in_channels=1, latent_dim=32, frame_size=64,
+                      channels=[4, 8, 16, 32])
+        standard = PixelVAE(**kwargs, coord_conv=False)
+        coordconv = PixelVAE(**kwargs, coord_conv=True)
+        n_std = sum(p.numel() for p in standard.parameters())
+        n_cc = sum(p.numel() for p in coordconv.parameters())
+        # Only the first conv layer changes: in_channels+2 vs in_channels.
+        # Extra params = channels[0] * 2 * kernel_size^2 = 4 * 2 * 16 = 128
+        assert n_cc > n_std
+        assert n_cc - n_std == 4 * 2 * 4 * 4  # channels[0] * 2 * k * k
+
+    def test_coord_conv_with_rgb(self):
+        """coord_conv works with 3-channel RGB input (3+2=5 encoder channels)."""
+        model = PixelVAE(in_channels=3, latent_dim=32, frame_size=64,
+                         channels=[4, 8, 16, 32], coord_conv=True)
+        x = torch.rand(2, 3, 64, 64)
+        recon, mu, logvar, _ = model(x)
+        assert recon.shape == (2, 3, 64, 64)
+
+    def test_coord_conv_with_state_head(self):
+        """coord_conv + state_dim work together."""
+        model = PixelVAE(in_channels=1, latent_dim=32, frame_size=64,
+                         channels=[4, 8, 16, 32], coord_conv=True,
+                         state_dim=6)
+        x = torch.rand(2, 1, 64, 64)
+        recon, mu, logvar, state_pred = model(x)
+        assert state_pred.shape == (2, 6)
+
+    def test_coord_conv_128_resolution(self):
+        """Coordinate grids scale to 128x128."""
+        model = PixelVAE(in_channels=1, latent_dim=32, frame_size=128,
+                         channels=[4, 8, 16, 32], coord_conv=True)
+        x = torch.rand(2, 1, 128, 128)
+        recon, mu, logvar, _ = model(x)
+        assert recon.shape == (2, 1, 128, 128)
+
+    def test_coord_conv_default_off(self):
+        """coord_conv defaults to False — no change to existing behavior."""
+        model = PixelVAE(in_channels=1, latent_dim=32, frame_size=64,
+                         channels=[4, 8, 16, 32])
+        assert not model.coord_conv

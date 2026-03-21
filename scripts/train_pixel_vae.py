@@ -91,6 +91,9 @@ def parse_args():
     p.add_argument("--resume", type=str, default=None,
                    help="Path to checkpoint (.pt) to resume from. Restores model weights, "
                         "optimizer state, epoch, and global_step.")
+    p.add_argument("--coord-conv", action="store_true", default=False,
+                   help="CoordConv: append x,y coordinate channels to encoder input. "
+                        "Gives CNN explicit spatial info — helps with rotation/position.")
     return p.parse_args()
 
 
@@ -150,6 +153,7 @@ def main():
         channels=args.channels,
         beta=args.beta,
         state_dim=args.state_dim,
+        coord_conv=args.coord_conv,
     ).to(args.device)
 
     param_count = sum(p.numel() for p in vae.parameters())
@@ -203,6 +207,7 @@ def main():
         "grad_clip": args.grad_clip,
         "data_path": args.data_path,
         "grayscale": args.grayscale,
+        "coord_conv": args.coord_conv,
     }
     import json
     with open(vae_dir / "config.json", "w") as f:

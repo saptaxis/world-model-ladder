@@ -82,6 +82,7 @@ def load_vae(checkpoint_path: str, device: str) -> PixelVAE:
         frame_size=cfg["frame_size"],
         channels=cfg.get("channels", [32, 64, 128, 256]),
         state_dim=cfg.get("state_dim", 0),
+        coord_conv=cfg.get("coord_conv", False),
     )
     vae.load_state_dict(ckpt["model_state_dict"])
     vae.to(device)

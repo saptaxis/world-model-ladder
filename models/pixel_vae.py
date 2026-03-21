@@ -39,12 +39,14 @@ class PixelVAE(nn.Module):
         channels: list[int] | None = None,
         beta: float = 0.0001,
         state_dim: int = 0,
+        coord_conv: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.latent_dim = latent_dim
         self.frame_size = frame_size
         self.beta = beta
+        self.coord_conv = coord_conv
 
         # Default channel progression doubles at each layer following the
         # ArcadeDreamer convention — 32→64→128→256 gives 4x capacity growth
@@ -53,15 +55,35 @@ class PixelVAE(nn.Module):
             channels = [32, 64, 128, 256]
         self.channels = channels
 
+        # CoordConv (Liu et al., 2018): append fixed x,y coordinate meshgrids
+        # as extra input channels. Gives the CNN explicit spatial information
+        # so it doesn't have to learn positional encoding from scratch. Helps
+        # with rotation/position which require spatial reasoning.
+        # Only affects encoder — decoder gets spatial info via the latent vector.
+        encoder_in_ch = in_channels + 2 if coord_conv else in_channels
+
         # Build encoder: sequence of Conv2d(kernel=4, stride=2, pad=1) + ReLU
         # Each layer halves spatial dims: 84->42->21->10->5, 128->64->32->16->8
         enc_layers = []
-        prev_ch = in_channels
+        prev_ch = encoder_in_ch
         for ch in channels:
             enc_layers.append(nn.Conv2d(prev_ch, ch, kernel_size=4, stride=2, padding=1))
             enc_layers.append(nn.ReLU(inplace=True))
             prev_ch = ch
         self.encoder_conv = nn.Sequential(*enc_layers)
+
+        # Register fixed coordinate grids as buffers — they move with model.to(device)
+        # and are included in state_dict for checkpoint round-trips. Normalized
+        # to [-1, 1] so the coordinate signal has similar scale to pixel values.
+        if coord_conv:
+            # x varies across columns (left=-1 to right=+1)
+            x_grid = torch.linspace(-1, 1, frame_size).view(1, 1, 1, frame_size).expand(
+                1, 1, frame_size, frame_size)
+            # y varies across rows (top=-1 to bottom=+1)
+            y_grid = torch.linspace(-1, 1, frame_size).view(1, 1, frame_size, 1).expand(
+                1, 1, frame_size, frame_size)
+            self.register_buffer("_coord_x", x_grid)
+            self.register_buffer("_coord_y", y_grid)
 
         # Compute spatial size after encoder convolutions.
         # Each conv with k=4, s=2, p=1: out = floor((in + 2*1 - 4) / 2 + 1) = floor(in/2)
@@ -138,6 +160,15 @@ class PixelVAE(nn.Module):
 
     def encode_params(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Encode frames to (mu, logvar) parameters."""
+        if self.coord_conv:
+            B = x.size(0)
+            # Expand fixed grids to batch size and concatenate with input.
+            # (B, C, H, W) + (B, 1, H, W) + (B, 1, H, W) -> (B, C+2, H, W)
+            coords = torch.cat([
+                self._coord_x.expand(B, -1, -1, -1),
+                self._coord_y.expand(B, -1, -1, -1),
+            ], dim=1)
+            x = torch.cat([x, coords], dim=1)
         h = self.encoder_conv(x)
         # Flatten spatial dims: (B, C_last, S, S) -> (B, C_last * S * S)
         # so the linear projection can map to latent_dim
