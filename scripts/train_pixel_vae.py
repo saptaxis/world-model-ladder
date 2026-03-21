@@ -291,10 +291,15 @@ def main():
         if ctx.writer:
             ctx.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], ctx.global_step)
 
-        # Step the LR scheduler on val loss (set by the validation callback).
-        # Only fires when both the scheduler exists and a val pass has run.
+        # Step the LR scheduler every time val_loss changes (per val check),
+        # not once per epoch. lr_patience=5 should mean 5 val checks without
+        # improvement, not 5 epochs. With val_every=500 and 35K steps/epoch,
+        # epoch-level stepping would wait ~70x too long.
         if scheduler is not None and "val_loss" in ctx.extras:
-            scheduler.step(ctx.extras["val_loss"])
+            current_val = ctx.extras["val_loss"]
+            if not hasattr(scheduler, "_last_val_seen") or current_val != scheduler._last_val_seen:
+                scheduler.step(current_val)
+                scheduler._last_val_seen = current_val
 
         for cb in callbacks:
             if cb.on_epoch_end(ctx) is False:
