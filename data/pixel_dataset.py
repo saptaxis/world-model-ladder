@@ -96,16 +96,27 @@ def _load_one_episode(args: tuple) -> np.ndarray | None:
 
 
 def _load_one_episode_states(args: tuple) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Load frames + states from a single episode. For multiprocessing.Pool."""
-    path, frame_size, grayscale, state_dim = args
+    """Load frames + states from a single episode. For multiprocessing.Pool.
+
+    The 4th arg can be:
+      - int (state_dim): legacy, slices states[:, :state_dim]
+      - list[int] (state_targets): index-based, slices states[:, state_targets]
+    """
+    path, frame_size, grayscale, state_spec = args
     try:
         with np.load(str(path)) as data:
             raw_frames = data["rgb_frames"]
-            # States in the npz are (T+1, full_state_dim) — the full 8D
-            # LunarLander state vector. We slice to state_dim (typically 6)
-            # to drop leg-contact booleans that aren't useful for the aux
-            # state prediction head. Cast to float32 for torch compatibility.
-            states = data["states"][:, :state_dim].astype(np.float32) if "states" in data else None
+            if "states" in data:
+                all_states = data["states"]
+                # Dispatch on type: int = first-N slice, list = index selection.
+                # Index selection is needed for kin_targets=[4,5] (angle-only)
+                # where we want specific non-contiguous dims from the 8D state.
+                if isinstance(state_spec, (list, tuple)):
+                    states = all_states[:, list(state_spec)].astype(np.float32)
+                else:
+                    states = all_states[:, :state_spec].astype(np.float32)
+            else:
+                states = None
         processed = np.stack([
             _preprocess_frame(raw_frames[i], frame_size, grayscale)
             for i in range(len(raw_frames))
@@ -194,10 +205,20 @@ class PixelFrameDataset(Dataset):
                  grayscale: bool = True, split: str | None = None,
                  val_fraction: float = 0.1, seed: int = 0,
                  n_workers: int = 8, cache_path: str | Path | None = None,
-                 state_dim: int = 0):
+                 state_dim: int = 0,
+                 state_targets: list[int] | None = None):
         self.frame_size = frame_size
         self.grayscale = grayscale
-        self.state_dim = state_dim
+        # state_targets overrides state_dim: if state_targets=[4,5] is given,
+        # state_dim becomes 2 (the number of selected dims), not the raw 6.
+        if state_targets is not None:
+            self.state_dim = len(state_targets)
+            # _state_spec is what we pass to the worker — list triggers index selection
+            self._state_spec = list(state_targets)
+        else:
+            self.state_dim = state_dim
+            # int triggers legacy first-N slice
+            self._state_spec = state_dim
         self._states = None  # (N, state_dim) float32 or None; only populated when state_dim > 0
 
         # --- Cache fast path ---
@@ -212,10 +233,10 @@ class PixelFrameDataset(Dataset):
                 print(f"Loading from cache (mmap): {cache_path} ...")
                 self._frames = np.load(str(frames_file), mmap_mode='r')
                 states_file = Path(cache_path) / "states.npy"
-                if state_dim > 0:
+                if self.state_dim > 0:
                     if not states_file.exists():
                         raise ValueError(
-                            f"Cache at {cache_path} has no states.npy, but state_dim={state_dim}. "
+                            f"Cache at {cache_path} has no states.npy, but state_dim={self.state_dim}. "
                             f"Delete the cache dir and rerun."
                         )
                     self._states = np.load(str(states_file), mmap_mode='r')
@@ -233,18 +254,18 @@ class PixelFrameDataset(Dataset):
         if cache_path is not None and not Path(cache_path).is_dir():
             self._build_cache_streaming(
                 data_path, cache_path, frame_size, grayscale, split,
-                val_fraction, seed, n_workers, state_dim)
+                val_fraction, seed, n_workers, self._state_spec)
             # Now load from the freshly-built cache via mmap (top of __init__)
             frames_file = Path(cache_path) / "frames.npy"
             if frames_file.exists():
                 self._frames = np.load(str(frames_file), mmap_mode='r')
-                if state_dim > 0:
+                if self.state_dim > 0:
                     states_file = Path(cache_path) / "states.npy"
                     if states_file.exists():
                         self._states = np.load(str(states_file), mmap_mode='r')
                 n = self._frames.shape[0]
                 disk_mb = os.path.getsize(str(frames_file)) / 1024 / 1024
-                state_str = f" + {state_dim}D states" if self._states is not None else ""
+                state_str = f" + {self.state_dim}D states" if self._states is not None else ""
                 print(f"PixelFrameDataset: {n} frames{state_str} ({disk_mb:.0f} MB on disk, mmap)")
                 return
 
@@ -268,11 +289,11 @@ class PixelFrameDataset(Dataset):
         npz_files = [f for f in npz_files if "prepared" not in f.name]
         episode_files = _split_episodes(npz_files, split, val_fraction, seed)
 
-        if state_dim > 0:
+        if self.state_dim > 0:
             # Load frames + kinematic states for the auxiliary state prediction
             # head. States are used as supervised targets during VAE training
             # to encourage the latent space to encode physical quantities.
-            load_args = [(path, frame_size, grayscale, state_dim) for path in episode_files]
+            load_args = [(path, frame_size, grayscale, self._state_spec) for path in episode_files]
             all_frames = []
             all_states = []
             if n_workers > 1:
@@ -348,7 +369,7 @@ class PixelFrameDataset(Dataset):
 
     def _build_cache_streaming(
         self, data_path, cache_path, frame_size, grayscale,
-        split, val_fraction, seed, n_workers, state_dim,
+        split, val_fraction, seed, n_workers, state_spec,
     ):
         """Build the frame cache without loading all episodes into RAM.
 
@@ -412,11 +433,18 @@ class PixelFrameDataset(Dataset):
         frames_mmap = np.lib.format.open_memmap(
             str(frames_file), mode='w+', dtype=np.uint8, shape=frame_shape)
 
+        # Derive the number of state dims from the spec for mmap allocation.
+        # state_spec is either int (first-N slice) or list[int] (index selection).
+        if isinstance(state_spec, (list, tuple)):
+            n_state_dims = len(state_spec)
+        else:
+            n_state_dims = state_spec
+
         states_mmap = None
-        if state_dim > 0:
+        if n_state_dims > 0:
             states_mmap = np.lib.format.open_memmap(
                 str(states_file), mode='w+', dtype=np.float32,
-                shape=(total_frames, state_dim))
+                shape=(total_frames, n_state_dims))
 
         # Fill the mmap using parallel workers. Each worker loads one episode,
         # preprocesses its frames (decompress npz + resize + grayscale — CPU heavy),
@@ -428,25 +456,25 @@ class PixelFrameDataset(Dataset):
         if load_workers > 1:
             from multiprocessing import Pool
 
-            # Build args: each worker gets (path, frame_size, grayscale, state_dim)
+            # Build args: each worker gets (path, frame_size, grayscale, state_spec)
             # and returns preprocessed (frames, states_or_None)
             worker_args = []
             for i, path in enumerate(episode_files):
                 if frame_counts[i] > 0:
-                    if state_dim > 0:
-                        worker_args.append((path, frame_size, grayscale, state_dim))
+                    if n_state_dims > 0:
+                        worker_args.append((path, frame_size, grayscale, state_spec))
                     else:
                         worker_args.append((path, frame_size, grayscale))
 
             # Use the existing worker functions — they return preprocessed arrays
-            worker_fn = _load_one_episode_states if state_dim > 0 else _load_one_episode
+            worker_fn = _load_one_episode_states if n_state_dims > 0 else _load_one_episode
 
             with Pool(load_workers) as pool:
                 for result in tqdm(
                     pool.imap(worker_fn, worker_args),
                     total=len(worker_args), desc="Building cache", unit="ep",
                 ):
-                    if state_dim > 0:
+                    if n_state_dims > 0:
                         frames, states = result
                     else:
                         frames = result
@@ -458,7 +486,8 @@ class PixelFrameDataset(Dataset):
                     # Write this episode's preprocessed frames to the mmap
                     frames_mmap[offset:offset + n] = frames
                     if states_mmap is not None and states is not None:
-                        states_mmap[offset:offset + n] = states[:n, :state_dim]
+                        # Worker already selects the right dims, just write directly
+                        states_mmap[offset:offset + n] = states[:n]
                     offset += n
                     # frames/states go out of scope here — GC reclaims per iteration
         else:
@@ -474,7 +503,12 @@ class PixelFrameDataset(Dataset):
                             frame = _preprocess_frame(raw_frames[j], frame_size, grayscale)
                             frames_mmap[offset + j] = frame
                         if states_mmap is not None and "states" in data:
-                            states = data["states"][:n, :state_dim].astype(np.float32)
+                            all_states = data["states"]
+                            # Same dispatch as the worker: list = index, int = slice
+                            if isinstance(state_spec, (list, tuple)):
+                                states = all_states[:n, list(state_spec)].astype(np.float32)
+                            else:
+                                states = all_states[:n, :state_spec].astype(np.float32)
                             states_mmap[offset:offset + n] = states
                     offset += n
                 except Exception:
