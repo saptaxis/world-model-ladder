@@ -515,9 +515,15 @@ def main():
             ctx.writer.add_scalar("train/sampling_prob", sampling_prob, ctx.global_step)
             ctx.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], ctx.global_step)
 
-        # Step LR scheduler on val loss
+        # Step LR scheduler on val loss. The validation callback updates
+        # ctx.extras["val_loss"] multiple times per epoch (every val_every steps).
+        # We step the scheduler every time val_loss changes, not just once per
+        # epoch — so lr_patience=5 means 5 val checks, not 5 epochs.
         if scheduler is not None and "val_loss" in ctx.extras:
-            scheduler.step(ctx.extras["val_loss"])
+            current_val = ctx.extras["val_loss"]
+            if not hasattr(scheduler, "_last_val_seen") or current_val != scheduler._last_val_seen:
+                scheduler.step(current_val)
+                scheduler._last_val_seen = current_val
 
         for cb in callbacks:
             if cb.on_epoch_end(ctx) is False:
