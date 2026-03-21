@@ -67,6 +67,8 @@ VALID_COMBOS = {
     ("film", "multi_step_latent"),
     ("rssm", "multi_step_latent"),
     ("rssm", "latent_elbo"),
+    ("factored-dyn", "latent_mse"),
+    ("factored-dyn", "multi_step_latent"),
 }
 
 
@@ -175,7 +177,7 @@ def parse_args():
 
     # --- Model architecture selection ---
     p.add_argument("--model-type", type=str, default="gru",
-                   choices=["gru", "film", "rssm"],
+                   choices=["gru", "film", "rssm", "factored-dyn"],
                    help="Dynamics model architecture: gru (concat), film (FiLM conditioning), rssm")
     p.add_argument("--training-mode", type=str, default="latent_mse",
                    choices=["latent_mse", "multi_step_latent", "latent_elbo"],
@@ -372,6 +374,15 @@ def main():
             hidden_dim=args.hidden_size,
         ).to(args.device)
         model_label = "LatentRSSM"
+    elif args.model_type == "factored-dyn":
+        from models.factored_dynamics import FactoredDynamicsModel
+        dynamics = FactoredDynamicsModel(
+            latent_dim=latent_dim,
+            action_dim=args.action_dim,
+            hidden_size=args.hidden_size,
+            kin_dims=args.kin_dims,
+        ).to(args.device)
+        model_label = "FactoredDynamicsModel (shared GRU, split heads)"
     else:
         # Should be unreachable due to argparse choices, but be safe
         raise ValueError(f"Unknown model type: {args.model_type}")
