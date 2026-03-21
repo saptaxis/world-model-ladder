@@ -71,19 +71,42 @@ VALID_COMBOS = {
 
 
 def load_vae(checkpoint_path: str, device: str) -> PixelVAE:
-    """Load VAE from checkpoint, extracting config to recreate architecture."""
+    """Load VAE from checkpoint, dispatching on model_type for FactoredPixelVAE.
+
+    Reads the 'config' dict from the checkpoint to determine architecture.
+    Standard VAE: creates PixelVAE. Factored VAE: creates FactoredPixelVAE
+    with kin_targets and decoder_type from config.
+    """
     # weights_only=False because we stored config as a plain dict alongside
     # the state_dict — torch.load needs to unpickle it.
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     cfg = ckpt["config"]
-    vae = PixelVAE(
-        in_channels=cfg["in_channels"],
-        latent_dim=cfg["latent_dim"],
-        frame_size=cfg["frame_size"],
-        channels=cfg.get("channels", [32, 64, 128, 256]),
-        state_dim=cfg.get("state_dim", 0),
-        coord_conv=cfg.get("coord_conv", False),
-    )
+    model_type = cfg.get("model_type", "standard")
+
+    if model_type == "factored":
+        # Factored VAE with [z_kin, z_ctx] split — needs kin_targets and
+        # decoder_type from config to reconstruct the architecture.
+        from models.factored_pixel_vae import FactoredPixelVAE
+        vae = FactoredPixelVAE(
+            in_channels=cfg["in_channels"],
+            latent_dim=cfg["latent_dim"],
+            frame_size=cfg["frame_size"],
+            channels=cfg.get("channels", [32, 64, 128, 256]),
+            kin_targets=cfg.get("kin_targets", [0, 1, 2, 3, 4, 5]),
+            decoder_type=cfg.get("decoder_type", "concat"),
+            coord_conv=cfg.get("coord_conv", False),
+        )
+    else:
+        # Standard PixelVAE with optional MLP state head
+        vae = PixelVAE(
+            in_channels=cfg["in_channels"],
+            latent_dim=cfg["latent_dim"],
+            frame_size=cfg["frame_size"],
+            channels=cfg.get("channels", [32, 64, 128, 256]),
+            state_dim=cfg.get("state_dim", 0),
+            coord_conv=cfg.get("coord_conv", False),
+        )
+
     vae.load_state_dict(ckpt["model_state_dict"])
     vae.to(device)
     # Freeze the VAE entirely — Phase 2 only trains the dynamics model.

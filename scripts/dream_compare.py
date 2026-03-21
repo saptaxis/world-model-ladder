@@ -46,24 +46,39 @@ from models.pixel_world_model import PixelWorldModel
 
 def load_pixel_world_model(vae_path: str, dyn_path: str,
                            device: str) -> PixelWorldModel:
-    """Load trained PixelWorldModel from VAE + dynamics checkpoints."""
-    # Reconstruct VAE architecture from the config stored in the checkpoint,
-    # so the caller doesn't need to pass architecture flags manually.
+    """Load trained PixelWorldModel from VAE + dynamics checkpoints.
+
+    Dispatches on model_type in both VAE and dynamics configs to support
+    standard PixelVAE, FactoredPixelVAE, and all dynamics variants.
+    """
+    # --- VAE ---
     vae_ckpt = torch.load(vae_path, map_location=device, weights_only=False)
     cfg = vae_ckpt["config"]
-    vae = PixelVAE(
-        in_channels=cfg["in_channels"],
-        latent_dim=cfg["latent_dim"],
-        frame_size=cfg["frame_size"],
-        channels=cfg.get("channels", [32, 64, 128, 256]),
-        state_dim=cfg.get("state_dim", 0),
-        coord_conv=cfg.get("coord_conv", False),
-    )
+    vae_model_type = cfg.get("model_type", "standard")
+
+    if vae_model_type == "factored":
+        from models.factored_pixel_vae import FactoredPixelVAE
+        vae = FactoredPixelVAE(
+            in_channels=cfg["in_channels"],
+            latent_dim=cfg["latent_dim"],
+            frame_size=cfg["frame_size"],
+            channels=cfg.get("channels", [32, 64, 128, 256]),
+            kin_targets=cfg.get("kin_targets", [0, 1, 2, 3, 4, 5]),
+            decoder_type=cfg.get("decoder_type", "concat"),
+            coord_conv=cfg.get("coord_conv", False),
+        )
+    else:
+        vae = PixelVAE(
+            in_channels=cfg["in_channels"],
+            latent_dim=cfg["latent_dim"],
+            frame_size=cfg["frame_size"],
+            channels=cfg.get("channels", [32, 64, 128, 256]),
+            state_dim=cfg.get("state_dim", 0),
+            coord_conv=cfg.get("coord_conv", False),
+        )
     vae.load_state_dict(vae_ckpt["model_state_dict"])
 
-    # Dynamics model uses latent_dim from the VAE config (must match) and
-    # its own action_dim/hidden_size from its checkpoint config.
-    # Dispatch on model_type in the config to support both GRU and RSSM.
+    # --- Dynamics ---
     dyn_ckpt = torch.load(dyn_path, map_location=device, weights_only=False)
     dyn_cfg = dyn_ckpt["config"]
     model_type = dyn_cfg.get("model_type", "gru")
@@ -83,6 +98,14 @@ def load_pixel_world_model(vae_path: str, dyn_path: str,
             action_dim=dyn_cfg.get("action_dim", 2),
             hidden_size=dyn_cfg.get("hidden_size", 256),
         )
+    elif model_type == "factored-dyn":
+        from models.factored_dynamics import FactoredDynamicsModel
+        dynamics = FactoredDynamicsModel(
+            latent_dim=cfg["latent_dim"],
+            action_dim=dyn_cfg.get("action_dim", 2),
+            hidden_size=dyn_cfg.get("hidden_size", 256),
+            kin_dims=dyn_cfg.get("kin_dims", 6),
+        )
     else:
         dynamics = LatentDynamicsModel(
             latent_dim=cfg["latent_dim"],
@@ -91,7 +114,6 @@ def load_pixel_world_model(vae_path: str, dyn_path: str,
         )
     dynamics.load_state_dict(dyn_ckpt["model_state_dict"])
 
-    # Compose VAE + dynamics into a single PixelWorldModel for the dream API
     model = PixelWorldModel(vae, dynamics)
     model.to(device)
     model.eval()
