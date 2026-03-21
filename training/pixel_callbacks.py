@@ -98,6 +98,12 @@ class PixelVAEValidationCallback(TrainCallback):
         # Expose val_loss in extras so other callbacks can read it
         ctx.extras["val_loss"] = val_loss
 
+        # Step LR scheduler immediately when val_loss is computed — not
+        # at epoch level. lr_patience=N means N val checks, not N epochs.
+        scheduler = ctx.extras.get("scheduler")
+        if scheduler is not None:
+            scheduler.step(val_loss)
+
         if ctx.writer:
             # Log all loss components to TensorBoard for train/val comparison
             ctx.writer.add_scalar("val/loss", val_loss, ctx.global_step)
@@ -261,6 +267,11 @@ class PixelDynamicsValidationCallback(TrainCallback):
 
         val_loss = total_loss / max(n, 1)
         ctx.extras["val_loss"] = val_loss
+
+        # Step LR scheduler immediately when val_loss is computed
+        scheduler = ctx.extras.get("scheduler")
+        if scheduler is not None:
+            scheduler.step(val_loss)
 
         if ctx.writer:
             ctx.writer.add_scalar("val/loss", val_loss, ctx.global_step)

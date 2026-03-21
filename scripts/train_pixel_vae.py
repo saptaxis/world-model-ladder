@@ -239,7 +239,7 @@ def main():
         model=vae, optimizer=optimizer, writer=writer,
         global_step=start_step, epoch=start_epoch, run_dir=str(vae_dir),
         device=args.device,
-        extras={"config": config},
+        extras={"config": config, "scheduler": scheduler},
     )
 
     # --- SIGINT handler ---
@@ -291,15 +291,11 @@ def main():
         if ctx.writer:
             ctx.writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], ctx.global_step)
 
-        # Step the LR scheduler every time val_loss changes (per val check),
-        # not once per epoch. lr_patience=5 should mean 5 val checks without
-        # improvement, not 5 epochs. With val_every=500 and 35K steps/epoch,
-        # epoch-level stepping would wait ~70x too long.
-        if scheduler is not None and "val_loss" in ctx.extras:
-            current_val = ctx.extras["val_loss"]
-            if not hasattr(scheduler, "_last_val_seen") or current_val != scheduler._last_val_seen:
-                scheduler.step(current_val)
-                scheduler._last_val_seen = current_val
+        # NOTE: LR scheduler now steps inside the training loop via
+        # ctx.extras["scheduler"], not here. See pixel_vae_train_epoch.
+        # Keeping this comment for history — the epoch-level step was
+        # wrong because val_loss updates ~70 times per epoch but the
+        # scheduler only saw the last value.
 
         for cb in callbacks:
             if cb.on_epoch_end(ctx) is False:
